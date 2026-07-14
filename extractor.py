@@ -525,22 +525,47 @@ def _extract_page(page, method, client, model) -> list[Voter]:
     return parse_page_regex(page)
 
 
+def _page_valid_serials(text: str) -> set[str]:
+    """The serial numbers that genuinely appear on this page. Anything a parser
+    reports outside this set is an artefact (e.g. the lenient parser grabbing
+    '23' out of 'Age : 23') and must never reach the output -- such a bogus
+    serial would otherwise merge into, and corrupt, the real voter #23."""
+    return ({m.group(1) for m in _SERIAL_ANCHORED_RE.finditer(text or "")}
+            | {str(s) for s in _page_serial_markers(text or "")})
+
+
 def _repair_page(page, client, model) -> list[Voter]:
     """Re-extract a page every way we can and merge into the most complete set.
     Recovers voters the first pass missed and fills empty fields.
 
-    Positional goes FIRST: it is the only parser that understands the
-    transposed/stacked layouts, and it associates each EPIC with the right
-    voter, so on ties it must win over the strict parser."""
-    lists = [parse_page_positional(page), parse_page_regex(page),
-             parse_page_regex_lenient(page)]
+    Order matters. Positional is the most reliable (it understands the
+    transposed/stacked layouts and pins each EPIC to the right voter), so it
+    goes first and wins ties. The lenient parser guesses serials from nearby
+    integers, so it is only brought in when nothing else produced anything.
+    """
+    positional = parse_page_positional(page)
+    strict = parse_page_regex(page)
+    lists = [lst for lst in (positional, strict) if lst]
+
+    if not lists:  # last resort only
+        lenient = parse_page_regex_lenient(page)
+        if lenient:
+            lists.append(lenient)
     if client is not None:
         try:
-            lists.append(_llm_page(page, client, model))
+            llm = _llm_page(page, client, model)
+            if llm:
+                lists.append(llm)
         except Exception:
             pass
+    if not lists:
+        return []
+
     merged = _best_by_serial(lists)
-    return sorted(merged.values(), key=_serial_key)
+    valid = _page_valid_serials(page.markdown)
+    out = [v for v in merged.values()
+           if not valid or v.Serial_No in valid]
+    return sorted(out, key=_serial_key)
 
 
 def _single_page_pdf(pdf_bytes: bytes, idx: int) -> bytes:
