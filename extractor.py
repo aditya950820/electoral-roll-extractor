@@ -220,14 +220,102 @@ def _page_serial_markers(text: str) -> set[int]:
     return {int(m.group(1)) for m in _SERIAL_MARKER_RE.finditer(text or "")}
 
 
+# ---- positional parser: layout-agnostic.
+#
+# Mistral renders these rolls in several different layouts depending on how
+# full the page is:
+#   A (normal)     **91** Name : X ... Gender : Female | CRC0108787 |
+#   B (transposed) |  421 | CRC0276709 | 422 | CRC0276733 |
+#                  |  Name : PIRANG ... | | Name : TINGNYE ... |
+#   C (stacked)    421 \n CRC0276709 \n Name : PIRANG ...
+# In EVERY layout the serials, EPICs and name-blocks appear in the same reading
+# order, so when all three counts agree we can zip them 1:1. That fixes both
+# the pages the strict parser drops entirely (B) and the EPIC-off-by-one it
+# would otherwise pick up from the *next* voter.
+_SERIAL_ANCHORED_RE = re.compile(
+    r"(?:\*{0,2})(\d{1,4})(?:\*{0,2})\s*\|?\s*"
+    r"(?=(?:[A-Z]{2,4}[0-9]{6,8}\b)|[Nn]ame\s*[:：])"
+)
+
+
+def _page_has_voter_content(text: str) -> bool:
+    """Does this page clearly hold voter records? Used so a page can never be
+    silently skipped just because the strict parser understood none of it."""
+    return bool(_EPIC_RE.search(text or "")) and bool(
+        re.search(r"[Nn]ame\s*[:：]", text or ""))
+
+
+# The page header ("Assembly Constituency No and Name : 58-KANUBARI",
+# "Section No and Name : 1-DASATHONG") also contains "Name :" — it is NOT an
+# elector and must never be counted as one.
+_HEADER_NAME_RE = re.compile(r"No\s+and\s*$", re.I)
+
+
+def _is_elector_name_anchor(text: str, start: int) -> bool:
+    pre = text[max(0, start - 40):start]
+    if _REL_PREFIX_RE.search(pre):
+        return False            # "<Relation>s Name :"
+    if _HEADER_NAME_RE.search(pre):
+        return False            # "...No and Name :" -> page header
+    return True
+
+
+def _elector_name_anchors(text: str):
+    return [m for m in _NAME_ANCHOR_RE.finditer(text)
+            if _is_elector_name_anchor(text, m.start())]
+
+
+def _elector_name_blocks(text: str) -> list[str]:
+    anchors = _elector_name_anchors(text)
+    blocks = []
+    for i, m in enumerate(anchors):
+        end = anchors[i + 1].start() if i + 1 < len(anchors) else len(text)
+        blocks.append(text[m.start():end])
+    return blocks
+
+
+def parse_page_positional(page: PageText) -> list[Voter]:
+    text = page.markdown or ""
+    serials = [m.group(1) for m in _SERIAL_ANCHORED_RE.finditer(text)]
+    epics = _EPIC_RE.findall(text)
+    blocks = _elector_name_blocks(text)
+
+    # Only trust the 1:1 zip when all three agree; otherwise bail so the
+    # other parsers handle it (never emit misaligned data).
+    if not blocks or not (len(serials) == len(epics) == len(blocks)):
+        return []
+
+    voters: list[Voter] = []
+    for s, e, blk in zip(serials, epics, blocks):
+        v = Voter(Page=page.index + 1, Serial_No=s, EPIC_No=e)
+        nm = _NAME_FIELD_RE.search(blk)
+        if nm:
+            v.Name = _clean(nm.group(1))
+        rel = _REL_FIELD_RE.search(blk)
+        if rel:
+            v.Relation_Type = _canon_rel(rel.group(1))
+            v.Relation_Name = _clean(rel.group(2))
+        hm = _HOUSE_RE.search(blk)
+        if hm:
+            v.House_Number = _clean(hm.group(1))
+        am = _AGE_RE.search(blk)
+        if am:
+            v.Age = am.group(1)
+        gm = _GENDER_RE.search(blk)
+        if gm:
+            g = gm.group(1).upper()
+            v.Gender = {"M": "Male", "F": "Female"}.get(
+                g, re.sub(r"\s+", " ", gm.group(1)).title())
+        if v.Name:
+            voters.append(v)
+    return voters
+
+
 def parse_page_regex_lenient(page: PageText) -> list[Voter]:
     text = page.markdown or ""
-    anchors = []
-    for m in _NAME_ANCHOR_RE.finditer(text):
-        pre = text[max(0, m.start() - 14):m.start()]
-        if _REL_PREFIX_RE.search(pre):
-            continue  # this is "<Relation>s Name :", not an elector name
-        anchors.append(m)
+    # Same filter as the positional parser: skip relation names AND the page
+    # header, which also contains a "Name :".
+    anchors = _elector_name_anchors(text)
 
     voters: list[Voter] = []
     for i, m in enumerate(anchors):
@@ -439,8 +527,13 @@ def _extract_page(page, method, client, model) -> list[Voter]:
 
 def _repair_page(page, client, model) -> list[Voter]:
     """Re-extract a page every way we can and merge into the most complete set.
-    Recovers voters the first pass missed and fills empty fields."""
-    lists = [parse_page_regex(page), parse_page_regex_lenient(page)]
+    Recovers voters the first pass missed and fills empty fields.
+
+    Positional goes FIRST: it is the only parser that understands the
+    transposed/stacked layouts, and it associates each EPIC with the right
+    voter, so on ties it must win over the strict parser."""
+    lists = [parse_page_positional(page), parse_page_regex(page),
+             parse_page_regex_lenient(page)]
     if client is not None:
         try:
             lists.append(_llm_page(page, client, model))
@@ -538,7 +631,11 @@ def build_rows(
         markers = _page_serial_markers(p.markdown)
         got = {int(v.Serial_No) for v in vs if v.Serial_No.isdigit()}
         incomplete = any(_completeness(v) < len(REQUIRED_FIELDS) for v in vs)
-        if (markers - got) or incomplete or len(vs) < len(markers):
+        # A page that clearly holds voters but parsed none is the silent-skip
+        # case (transposed sparse pages): it has no markers, so the checks
+        # above would all pass. Force a repair on it.
+        skipped = not vs and _page_has_voter_content(p.markdown)
+        if (markers - got) or incomplete or len(vs) < len(markers) or skipped:
             page_voters[p.index] = _repair_page(p, client, model)
 
     voters = [v for idx in sorted(page_voters) for v in page_voters[idx]]

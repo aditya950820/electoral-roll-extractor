@@ -71,4 +71,28 @@ for r in rrows:
 assert rissues["missing_serials"] == [], rissues
 assert rissues["incomplete_rows"] == [], rissues
 
+# ---- transposed sparse-page layout (this page was silently SKIPPED: the
+# ---- serial+EPIC sit in a header row, the names in a separate row below).
+TRANSPOSED = """Assembly Constituency No and Name : 58-KANUBARI
+Section No and Name 1-DASATHONG
+
+Part No. : 2
+
+|  421 | CRC0276709 | 422 | CRC0276733  |
+| --- | --- | --- | --- |
+|  Name : PIRANG JAMIKHAM Fathers Name : JANKO JAMIKHAM House Number : E-579 Age : 23 Gender : Female |  | Name : TINGNYE JAMIKHAM Fathers Name : JANKO JAMIKHAM House Number : E-579 Age : 23 Gender : Male |   |
+"""
+trows, tissues = build_rows([PageText(index=16, markdown=TRANSPOSED)],
+                            method="regex")
+assert len(trows) == 2, f"transposed page lost voters: {len(trows)}"
+t = {r["Serial_No"]: r for r in trows}
+# EPIC must belong to the RIGHT voter (it used to be stolen from the next one)
+assert t["421"]["EPIC_No"] == "CRC0276709", t["421"]
+assert t["422"]["EPIC_No"] == "CRC0276733", t["422"]
+assert t["421"]["Name"] == "PIRANG JAMIKHAM"
+assert t["422"]["Name"] == "TINGNYE JAMIKHAM"
+assert tissues["incomplete_rows"] == [], tissues
+# the page header ("...No and Name : 58-KANUBARI") must never become a voter
+assert all(r["Name"] != "58-KANUBARI" for r in trows)
+
 print("\nALL ASSERTIONS PASSED")

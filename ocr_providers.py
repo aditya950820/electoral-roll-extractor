@@ -38,6 +38,34 @@ class OCRProvider(ABC):
         raise NotImplementedError
 
 
+def _rerender(pdf_bytes: bytes, zoom: float) -> bytes:
+    """Rasterise every page at `zoom` and rebuild the PDF.
+
+    Mistral's OCR is resolution-sensitive on these scanned rolls: at native
+    resolution it drops EPIC cells from the table. Feeding it a higher-res
+    render recovers them. Returns the original bytes if anything goes wrong.
+    """
+    if zoom <= 1.0:
+        return pdf_bytes
+    try:
+        import fitz
+
+        src = fitz.open(stream=pdf_bytes, filetype="pdf")
+        out = fitz.open()
+        mat = fitz.Matrix(zoom, zoom)
+        for page in src:
+            pix = page.get_pixmap(matrix=mat)
+            new = out.new_page(width=pix.width, height=pix.height)
+            new.insert_image(fitz.Rect(0, 0, pix.width, pix.height),
+                             stream=pix.tobytes("png"))
+        data = out.tobytes()
+        src.close()
+        out.close()
+        return data
+    except Exception:
+        return pdf_bytes
+
+
 class MistralOCRProvider(OCRProvider):
     """Uses Mistral's dedicated Document OCR endpoint (mistral-ocr-latest)."""
 
@@ -46,6 +74,7 @@ class MistralOCRProvider(OCRProvider):
     def __init__(self, api_key: str | None = None, model: str | None = None):
         self.api_key = api_key or os.getenv("MISTRAL_API_KEY")
         self.model = model or os.getenv("OCR_MODEL", "mistral-ocr-latest")
+        self.render_zoom = float(os.getenv("OCR_RENDER_ZOOM", "2.0"))
         if not self.api_key:
             raise RuntimeError(
                 "MISTRAL_API_KEY is not set. Add it to your .env file."
@@ -54,6 +83,12 @@ class MistralOCRProvider(OCRProvider):
     def ocr_pdf(self, pdf_bytes: bytes, include_images: bool = False) -> list[PageText]:
         # Imported lazily so the app can start even before the SDK is installed.
         from mistralai import Mistral
+
+        # Scanned rolls come in at a resolution where Mistral's table parser
+        # silently drops the EPIC column (emits 4 cells per row instead of 6).
+        # Re-rendering each page at 2x makes it emit the full table. Verified:
+        # a page that returned 10/30 EPICs returns 30/30 after re-rendering.
+        pdf_bytes = _rerender(pdf_bytes, self.render_zoom)
 
         client = Mistral(api_key=self.api_key)
         data_uri = "data:application/pdf;base64," + base64.b64encode(pdf_bytes).decode()
