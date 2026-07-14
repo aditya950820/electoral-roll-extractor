@@ -7,6 +7,8 @@ services:
       - "8501:8501"
     environment:
       MISTRAL_API_KEY: ${MISTRAL_API_KEY}
+      APP_USERNAME: ${APP_USERNAME}
+      APP_PASSWORD_HASH: ${APP_PASSWORD_HASH}
       OCR_PROVIDER: ${OCR_PROVIDER:-mistral}
       OCR_MODEL: ${OCR_MODEL:-mistral-ocr-latest}
       STRUCTURE_MODEL: ${STRUCTURE_MODEL:-mistral-small-latest}

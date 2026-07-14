@@ -20,7 +20,16 @@ ENV STREAMLIT_SERVER_PORT=8501 \
     STREAMLIT_SERVER_HEADLESS=true \
     STREAMLIT_BROWSER_GATHER_USAGE_STATS=false \
     STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION=true \
-    STREAMLIT_SERVER_MAX_UPLOAD_SIZE=200
+    STREAMLIT_SERVER_ENABLE_CORS=false \
+    STREAMLIT_SERVER_MAX_UPLOAD_SIZE=200 \
+    STREAMLIT_CLIENT_TOOLBAR_MODE=minimal \
+    STREAMLIT_CLIENT_SHOW_ERROR_DETAILS=false \
+    STREAMLIT_GLOBAL_DEVELOPMENT_MODE=false
+
+# Drop root: run the app as an unprivileged user.
+RUN useradd --create-home --uid 10001 appuser \
+    && chown -R appuser:appuser /app
+USER appuser
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8501/_stcore/health').read()==b'ok' else 1)"

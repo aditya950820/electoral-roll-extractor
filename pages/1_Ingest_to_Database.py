@@ -8,11 +8,14 @@ import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
+from auth import require_auth
 from dbx import connect, db_ready, init_schema, ingest_dataframe
 
 load_dotenv()
 
 st.set_page_config(page_title="Ingest → Database", page_icon="📥", layout="wide")
+
+require_auth()   # nothing below runs for an unauthenticated visitor
 st.title("📥 Ingest into Database")
 st.caption("Load extracted rolls into Postgres so they can be cross-checked "
            "against every other roll for duplicates and photo reuse.")

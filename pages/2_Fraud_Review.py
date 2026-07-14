@@ -5,6 +5,7 @@ import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
+from auth import require_auth
 from dbx import db_ready
 from fraud_rules import (RULES, clear_flags, flag_summary, get_photo,
                          open_flags, record_review, run_rules)
@@ -12,6 +13,8 @@ from fraud_rules import (RULES, clear_flags, flag_summary, get_photo,
 load_dotenv()
 
 st.set_page_config(page_title="Fraud Review", page_icon="🔍", layout="wide")
+
+require_auth()   # nothing below runs for an unauthenticated visitor
 st.title("🔍 Fraud Detection & Review")
 
 ok, msg = db_ready()

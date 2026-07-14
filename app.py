@@ -7,6 +7,7 @@ import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
+from auth import require_auth
 from pdf_utils import get_page_count, trim_pages
 from ocr_providers import get_provider
 from pipeline import process_pdf, BATCH_THRESHOLD, BATCH_SIZE
@@ -16,6 +17,9 @@ load_dotenv()
 
 st.set_page_config(page_title="Electoral Roll → Excel", page_icon="🗳️",
                    layout="centered")
+
+require_auth()   # nothing below runs for an unauthenticated visitor
+
 st.title("🗳️ Electoral Roll → Excel")
 st.caption("Upload an electoral-roll PDF → get an Excel + photos, bundled as a "
            "single ZIP. Large PDFs are OCR'd in batches for accuracy.")
