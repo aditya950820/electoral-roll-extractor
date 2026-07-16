@@ -289,6 +289,73 @@ def record_review(flag_id: int, verdict: str, reviewer: str, notes: str = ""):
         c.commit()
 
 
+# Every flag (open or reviewed), latest verdict if any -> used for the "download
+# all flags" export so it mirrors exactly what the review UI shows per side.
+_LATEST_REVIEW_LEFT = """
+    LEFT JOIN LATERAL (SELECT verdict, reviewer, notes, reviewed_at
+                       FROM reviews WHERE flag_id = f.id
+                       ORDER BY reviewed_at DESC, id DESC LIMIT 1) r ON TRUE
+"""
+
+
+def all_flags_for_export(rule: str | None = None):
+    """Every flag, both sides' full voter details, and latest verdict (if
+    reviewed) — most severe / most recent first. Feeds the Excel export."""
+    q = f"""
+        SELECT f.id, f.rule, f.severity, f.score, f.details,
+               f.voter_id, f.related_voter_id,
+               r.verdict, r.reviewer, r.notes, r.reviewed_at,
+               va.name AS name_a, va.epic_no AS epic_a, va.relation_type AS relation_type_a,
+               va.relation_name AS relation_name_a, va.part_no AS part_a,
+               va.house_number AS house_a, va.age AS age_a, va.gender AS gender_a,
+               va.constituency_no AS const_a, va.serial_no AS serial_a,
+               vb.name AS name_b, vb.epic_no AS epic_b, vb.relation_type AS relation_type_b,
+               vb.relation_name AS relation_name_b, vb.part_no AS part_b,
+               vb.house_number AS house_b, vb.age AS age_b, vb.gender AS gender_b,
+               vb.constituency_no AS const_b, vb.serial_no AS serial_b
+        FROM flags f
+        {_LATEST_REVIEW_LEFT}
+        JOIN voters va ON va.id = f.voter_id
+        LEFT JOIN voters vb ON vb.id = f.related_voter_id
+        WHERE TRUE
+    """
+    params: list = []
+    if rule:
+        q += " AND f.rule = %s"
+        params.append(rule)
+    q += """ ORDER BY CASE f.severity WHEN 'high' THEN 1 WHEN 'medium' THEN 2
+                       ELSE 3 END, f.score DESC NULLS LAST, f.id"""
+    with connect() as c:
+        return c.execute(q, params).fetchall()
+
+
+def house_overload_members_for_export(rule: str | None = None):
+    """One row per occupant for every open house_overload flag — mirrors the
+    'All electors in this house' table in the review UI."""
+    if rule not in (None, "house_overload"):
+        return []
+    with connect() as c:
+        flags = c.execute("""
+            SELECT id AS flag_id, details FROM flags WHERE rule = 'house_overload'
+        """).fetchall()
+        out = []
+        for fl in flags:
+            d = fl["details"] or {}
+            members = c.execute(
+                """SELECT id, name, relation_type, relation_name, age, gender,
+                          serial_no, part_no, house_number, epic_no, constituency_no
+                   FROM voters
+                   WHERE coalesce(constituency_no,'') = coalesce(%s,'')
+                     AND house_norm = %s
+                   ORDER BY part_no, serial_no NULLS LAST, id""",
+                (d.get("constituency_no"), d.get("house_norm")),
+            ).fetchall()
+            for m in members:
+                out.append({"flag_id": fl["flag_id"], "house": d.get("house"),
+                           "constituency_no": d.get("constituency_no"), **m})
+        return out
+
+
 def get_photo(voter_id: int) -> bytes | None:
     with connect() as c:
         r = c.execute("SELECT image FROM photos WHERE voter_id=%s",

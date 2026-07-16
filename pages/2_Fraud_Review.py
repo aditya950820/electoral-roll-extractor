@@ -9,8 +9,8 @@ from auth import require_auth
 from dbx import db_ready
 from fraud_rules import (RULES, clear_flags, flag_summary, open_flags,
                          record_review, run_rules)
-from ui_helpers import (flag_card, flag_title, infinite_limit,
-                        infinite_scroll_sentinel)
+from ui_helpers import (build_flags_export, flag_card, flag_title,
+                        infinite_limit, infinite_scroll_sentinel)
 
 load_dotenv()
 
@@ -61,6 +61,16 @@ else:
 st.divider()
 st.subheader("Review queue")
 rule_filter = st.selectbox("Filter by rule", ["(all)"] + list(RULES))
+
+st.download_button(
+    "⬇️ Download all flags (Excel)",
+    data=build_flags_export(None if rule_filter == "(all)" else rule_filter),
+    file_name="fraud_flags.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    help="Both voters' full details side-by-side for every flag (open + "
+         "reviewed) matching the current rule filter, plus a sheet listing "
+         "every occupant of each flagged house.",
+)
 
 # Infinite scroll: fetch one page more than currently shown; the sentinel at
 # the bottom bumps the limit when the user scrolls to it.
