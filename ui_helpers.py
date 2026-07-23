@@ -9,8 +9,8 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from family import analyse_household, cluster_dot
-from fraud_rules import (all_flags_for_export, get_photo, get_photos,
-                         house_members)
+from fraud_rules import (all_flags_for_export, flagged_constituencies,
+                         get_photo, get_photos, house_members)
 
 # ---------------------------------------------------------------- infinite scroll
 PAGE_STEP = 100
@@ -170,12 +170,14 @@ def _pdf_draw_voter(page, x: float, y: float, w: float, h: float,
     page.insert_textbox(body, "\n".join(lines[1:]), fontsize=7, fontname="helv")
 
 
-def build_flags_pdf(rule_filter: str | None, year: int | None = None) -> bytes:
+def build_flags_pdf(rule_filter: str | None, year: int | None = None,
+                    constituency: str | None = None) -> bytes:
     """PDF of every flag matching the filter: each flag is one side-by-side
     comparison (voter A vs voter B) with both photos and all details;
-    _PDF_PER_PAGE comparisons per A4 page."""
+    _PDF_PER_PAGE comparisons per A4 page. `constituency` limits the report
+    to one AC (attributed by voter A)."""
     import fitz
-    rows = all_flags_for_export(rule_filter, year)
+    rows = all_flags_for_export(rule_filter, year, constituency)
     ids = set()
     for f in rows:
         ids.add(f["voter_id"])
@@ -199,7 +201,8 @@ def build_flags_pdf(rule_filter: str | None, year: int | None = None) -> bytes:
             page.insert_textbox(
                 fitz.Rect(M, 20, pw - M, 44),
                 f"Fraud flags - {rule_filter or 'all rules'}"
-                f"{f' - {year}' if year else ''}   "
+                f"{f' - {year}' if year else ''}"
+                f"{f' - AC {constituency}' if constituency else ' - all ACs'}   "
                 f"(page {len(doc)},  {len(rows)} flag(s) total)",
                 fontsize=11, fontname="hebo")
             page.draw_line(fitz.Point(M, 46), fitz.Point(pw - M, 46),
@@ -249,6 +252,25 @@ def build_flags_pdf(rule_filter: str | None, year: int | None = None) -> bytes:
     out = doc.tobytes()
     doc.close()
     return out
+
+
+def build_flags_pdf_zip(rule_filter: str | None, year: int | None = None,
+                        progress=None) -> bytes:
+    """One PDF per constituency, bundled into a ZIP — the constituency-wise
+    counterpart of the single combined report."""
+    import io
+    import zipfile
+
+    acs = flagged_constituencies(year, rule_filter)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for i, ac in enumerate(acs, 1):
+            if progress:
+                progress(i, len(acs), ac)
+            safe = str(ac).replace("/", "-").replace(" ", "")
+            name = f"fraud_flags_{year or 'all'}_AC{safe}.pdf"
+            z.writestr(name, build_flags_pdf(rule_filter, year, ac))
+    return buf.getvalue()
 
 
 def _members_df(members: list, hh) -> "pd.DataFrame":

@@ -358,6 +358,47 @@ def flag_summary(year: int | None = None):
         return c.execute(q, params).fetchall()
 
 
+def flag_counts_by_constituency(year: int | None = None,
+                                rule: str | None = None):
+    """Total flags raised per constituency, most flags first.
+
+    A flag is attributed to the constituency of voter A (the flag's primary
+    voter). A cross-constituency pair therefore counts once, under A's AC —
+    it is one lead, not two."""
+    q = """
+        SELECT coalesce(nullif(va.constituency_no, ''), '(unknown)')
+                   AS constituency_no,
+               max(va.constituency_name)                    AS constituency_name,
+               count(DISTINCT f.id)                         AS flags,
+               count(DISTINCT f.id) FILTER (WHERE f.severity = 'high')   AS high,
+               count(DISTINCT f.id) FILTER (WHERE f.severity = 'medium') AS medium,
+               count(DISTINCT f.id) FILTER (WHERE f.severity = 'low')    AS low,
+               count(DISTINCT r.flag_id)                    AS reviewed
+        FROM flags f
+        JOIN voters va ON va.id = f.voter_id
+        LEFT JOIN reviews r ON r.flag_id = f.id
+        WHERE TRUE
+    """
+    params: list = []
+    if year is not None:
+        q += " AND va.year = %s"
+        params.append(int(year))
+    if rule:
+        q += " AND f.rule = %s"
+        params.append(rule)
+    q += " GROUP BY 1 ORDER BY flags DESC"
+    with connect() as c:
+        return c.execute(q, params).fetchall()
+
+
+def flagged_constituencies(year: int | None = None,
+                           rule: str | None = None) -> list[str]:
+    """Constituency numbers that actually have flags — drives the per-AC
+    download picker."""
+    return [r["constituency_no"]
+            for r in flag_counts_by_constituency(year, rule)]
+
+
 def open_flags(rule: str | None = None, limit: int = 200,
                year: int | None = None):
     """Flags awaiting human review, most severe first."""
@@ -501,9 +542,11 @@ _LATEST_REVIEW_LEFT = """
 """
 
 
-def all_flags_for_export(rule: str | None = None, year: int | None = None):
+def all_flags_for_export(rule: str | None = None, year: int | None = None,
+                         constituency: str | None = None):
     """Every flag, both sides' full voter details, and latest verdict (if
-    reviewed) — most severe / most recent first. Feeds the Excel export."""
+    reviewed) — most severe / most recent first. Feeds the PDF export.
+    `constituency` restricts to flags attributed to that AC (voter A's)."""
     q = f"""
         SELECT f.id, f.rule, f.severity, f.score, f.details,
                f.voter_id, f.related_voter_id,
@@ -529,6 +572,9 @@ def all_flags_for_export(rule: str | None = None, year: int | None = None):
     if rule:
         q += " AND f.rule = %s"
         params.append(rule)
+    if constituency:
+        q += " AND coalesce(nullif(va.constituency_no, ''), '(unknown)') = %s"
+        params.append(constituency)
     q += """ ORDER BY CASE f.severity WHEN 'high' THEN 1 WHEN 'medium' THEN 2
                        ELSE 3 END, f.score DESC NULLS LAST, f.id"""
     with connect() as c:
@@ -536,7 +582,8 @@ def all_flags_for_export(rule: str | None = None, year: int | None = None):
 
 
 def house_overload_members_for_export(rule: str | None = None,
-                                      year: int | None = None):
+                                      year: int | None = None,
+                                      constituency: str | None = None):
     """One row per occupant for every open house_overload flag — mirrors the
     'All electors in this house' table in the review UI."""
     if rule not in (None, "house_overload"):
@@ -548,6 +595,9 @@ def house_overload_members_for_export(rule: str | None = None,
     if year is not None:
         fq += " AND va.year = %s"
         fp.append(int(year))
+    if constituency:
+        fq += " AND coalesce(nullif(va.constituency_no, ''), '(unknown)') = %s"
+        fp.append(constituency)
     with connect() as c:
         flags = c.execute(fq, fp).fetchall()
         out = []

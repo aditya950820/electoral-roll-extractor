@@ -7,10 +7,11 @@ from dotenv import load_dotenv
 
 from auth import require_auth
 from dbx import available_years, db_ready
-from fraud_rules import (RULES, clear_flags, flag_summary, open_flags,
+from fraud_rules import (RULES, clear_flags, flag_counts_by_constituency,
+                         flag_summary, flagged_constituencies, open_flags,
                          record_review, run_rules)
-from ui_helpers import (build_flags_pdf, flag_card, flag_title,
-                        infinite_limit, infinite_scroll_sentinel)
+from ui_helpers import (build_flags_pdf, build_flags_pdf_zip, flag_card,
+                        flag_title, infinite_limit, infinite_scroll_sentinel)
 
 load_dotenv()
 
@@ -66,12 +67,31 @@ with st.sidebar:
 
 # ---------------------------------------------------------------- summary
 summary = flag_summary(year)
-if summary:
-    st.subheader(f"Flags by rule — {year}")
-    st.dataframe(pd.DataFrame(summary), use_container_width=True)
-else:
+if not summary:
     st.info(f"No flags for {year} yet — run the rules from the sidebar.")
     st.stop()
+
+s1, s2 = st.columns(2)
+with s1:
+    st.subheader(f"Flags by rule — {year}")
+    st.dataframe(pd.DataFrame(summary), use_container_width=True,
+                 hide_index=True)
+with s2:
+    st.subheader(f"Flags by constituency — {year}")
+    ac_counts = flag_counts_by_constituency(year)
+    ac_df = pd.DataFrame(ac_counts)
+    if not ac_df.empty:
+        ac_df = ac_df.rename(columns={
+            "constituency_no": "AC No.", "constituency_name": "AC Name",
+            "flags": "Total flags", "high": "High", "medium": "Medium",
+            "low": "Low", "reviewed": "Reviewed"})
+        st.dataframe(ac_df, use_container_width=True, hide_index=True)
+        st.caption(f"**{int(ac_df['Total flags'].sum()):,}** flags across "
+                   f"**{len(ac_df)}** constituenc"
+                   f"{'y' if len(ac_df) == 1 else 'ies'}. A cross-AC pair is "
+                   "counted once, under the first voter's AC.")
+    else:
+        st.caption("No constituency breakdown available.")
 
 # ---------------------------------------------------------------- queue
 st.divider()
@@ -79,22 +99,68 @@ st.subheader("Review queue")
 rule_filter = st.selectbox("Filter by rule", ["(all)"] + list(RULES))
 
 _filter = None if rule_filter == "(all)" else rule_filter
-# PDF embeds photos for every flag, so it is heavy — build only on click,
-# not on every rerun, and cache the bytes for the current filter + year.
-pdf_key = f"flags_pdf::{year}::{rule_filter}"
-if st.button("🧾 Prepare PDF (photos, 5 / page)",
-             help="Side-by-side comparison with both photos and all "
-                  "details for every flag matching the current filter and "
-                  "year — 5 comparisons per A4 page."):
-    with st.spinner(f"Building {year} PDF (embedding photos)…"):
-        st.session_state[pdf_key] = build_flags_pdf(_filter, year)
-if st.session_state.get(pdf_key):
-    st.download_button(
-        "⬇️ Download flags PDF",
-        data=st.session_state[pdf_key],
-        file_name=f"fraud_flags_{year}.pdf",
-        mime="application/pdf",
-    )
+
+# ---------------------------------------------------------------- downloads
+# PDFs embed photos, so they are heavy — build only on click, never on every
+# rerun, and cache the bytes against the exact scope they were built for.
+st.markdown("**Download flag report (PDF — photos, 5 comparisons / page)**")
+d_tot, d_ac = st.tabs(["📄 Total (all constituencies)", "🗂️ Constituency-wise"])
+
+with d_tot:
+    tot_key = f"flags_pdf::{year}::{rule_filter}::ALL"
+    if st.button("🧾 Prepare total PDF", key="prep_total",
+                 help="One report covering every constituency for the "
+                      "selected year and rule filter."):
+        with st.spinner(f"Building {year} total PDF (embedding photos)…"):
+            st.session_state[tot_key] = build_flags_pdf(_filter, year)
+    if st.session_state.get(tot_key):
+        st.download_button(
+            "⬇️ Download total PDF",
+            data=st.session_state[tot_key],
+            file_name=f"fraud_flags_{year}_all_ACs.pdf",
+            mime="application/pdf", key="dl_total")
+
+with d_ac:
+    acs = flagged_constituencies(year, _filter)
+    if not acs:
+        st.info("No constituencies with flags in this scope.")
+    else:
+        pick = st.selectbox("Constituency", acs,
+                            format_func=lambda a: f"AC {a}")
+        one_key = f"flags_pdf::{year}::{rule_filter}::{pick}"
+        b1, b2 = st.columns(2)
+        with b1:
+            if st.button(f"🧾 Prepare AC {pick} PDF", key="prep_one",
+                         use_container_width=True):
+                with st.spinner(f"Building AC {pick} PDF…"):
+                    st.session_state[one_key] = build_flags_pdf(
+                        _filter, year, pick)
+            if st.session_state.get(one_key):
+                st.download_button(
+                    f"⬇️ Download AC {pick} PDF",
+                    data=st.session_state[one_key],
+                    file_name=f"fraud_flags_{year}_AC{pick}.pdf",
+                    mime="application/pdf", key="dl_one",
+                    use_container_width=True)
+        with b2:
+            zip_key = f"flags_zip::{year}::{rule_filter}"
+            if st.button(f"🗜️ Prepare all {len(acs)} ACs (ZIP)", key="prep_zip",
+                         use_container_width=True,
+                         help="One separate PDF per constituency, bundled "
+                              "into a single ZIP."):
+                bar = st.progress(0.0, text="Starting…")
+                st.session_state[zip_key] = build_flags_pdf_zip(
+                    _filter, year,
+                    progress=lambda i, n, ac: bar.progress(
+                        i / n, text=f"AC {ac} ({i}/{n})"))
+                bar.empty()
+            if st.session_state.get(zip_key):
+                st.download_button(
+                    "⬇️ Download per-AC ZIP",
+                    data=st.session_state[zip_key],
+                    file_name=f"fraud_flags_{year}_by_constituency.zip",
+                    mime="application/zip", key="dl_zip",
+                    use_container_width=True)
 
 # Infinite scroll: fetch one page more than currently shown; the sentinel at
 # the bottom bumps the limit when the user scrolls to it.
