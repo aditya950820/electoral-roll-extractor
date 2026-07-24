@@ -16,7 +16,7 @@ from typing import Callable
 
 from psycopg.types.json import Json
 
-from dbx import connect, init_schema
+from dbx import connect, init_schema, norm_name, phonetic
 
 # ---------------------------------------------------------------- similarity
 # Two complementary record-linkage methods over ALL of a voter's data points
@@ -111,6 +111,371 @@ def _run_cosine(c, year: int) -> None:
                 """INSERT INTO flags (rule, severity, score, voter_id,
                                       related_voter_id, details)
                    VALUES ('cosine_dup', 'medium', %s, %s, %s, %s)
+                   ON CONFLICT DO NOTHING""",
+                batch,
+            )
+
+
+# =====================================================================
+# new_model_1 — probabilistic identity resolution over the VERIFIED record
+# =====================================================================
+# The single-signal rules above each look at one clue. new_model_1 is a
+# record-linkage MODEL: for a candidate pair it sums independent evidence
+# weights (log-evidence "points", the Fellegi–Sunter idea) across every data
+# point held for a voter, and flags the pair only when the total clears a
+# decision threshold. It differs from the other rules in three ways that matter
+# for this data:
+#
+#   1. It matches on the ECINET **verified_name**, not the OCR'd roll text.
+#      The two disagree on ~10% of enriched rows, so the roll name alone both
+#      misses real duplicates (OCR garbled one copy) and invents false ones.
+#   2. It is **quality-aware**. Two ECINET fields are dirty in characteristic
+#      ways and are explicitly discounted:
+#        • verified_dob defaults to `YYYY-01-01` when only the birth *year* is
+#          known — a placeholder that collides across unrelated people, so an
+#          01-Jan match scores far below a real-date match.
+#        • one mobile_no is routinely shared by a whole family / CSC operator
+#          (seen on up to 30 EPICs here), so a match on a high-multiplicity
+#          number is near-worthless and is down-weighted to almost nothing.
+#   3. It records **why**: every signal that fired — positive evidence and
+#      counter-evidence — is stored on the flag, so a reviewer sees the case,
+#      not just a number. Aadhaar reference agreement alone clears the bar;
+#      weaker clues must corroborate; disagreements (different real DOB,
+#      different gender, different Aadhaar) subtract so a mere phonetic name
+#      clash between two clearly different people does not flag.
+NM1_THRESHOLD        = 4.0   # total evidence points needed to raise a flag
+NM1_HIGH             = 6.0   # >= this total -> 'high' severity
+NM1_MOBILE_SHARE_CAP = 4     # a mobile on more EPICs than this is a shared phone
+NM1_NAME_STRONG_SIM  = 0.85  # trigram-cosine over verified names: near-identical
+NM1_NAME_WEAK_SIM    = 0.62  # …similar enough to be weak corroboration
+
+# agreement weights (evidence points added when the fields AGREE)
+_NM1_W = {
+    "aadhaar":         6.0,   # verified Aadhaar reference — near-certain identity
+    "dob_exact":       3.0,   # identical real birth date
+    "dob_placeholder": 1.0,   # identical 01-Jan default (birth-year only)
+    "dob_year":        0.4,   # birth year agrees, day differs / is a default
+    "name_exact":      2.5,
+    "name_strong":     1.6,
+    "name_phonetic":   0.9,
+    "name_weak":       0.5,
+    "mobile":          1.8,   # same mobile, held by few people
+    "mobile_shared":   0.3,   # same mobile, but it is a shared/booth number
+    "relation_epic":   2.0,   # same parent/relation EPIC
+    "parent_name":     0.6,   # father-or-guardian / mother name agrees
+    "spouse_name":     0.6,
+    "age_exact":       0.7,   # only used when DOB is absent on a side
+    "age_close":       0.4,
+    "house":           0.6,   # same normalised house in the same constituency
+    "gender_same":     0.25,
+}
+# counter-evidence (points SUBTRACTED when the fields disagree)
+_NM1_P = {
+    "dob_conflict":     -3.0,  # two different real birth dates -> different people
+    "aadhaar_conflict": -1.5,
+    "gender_diff":      -1.2,
+    "relation_conflict":-0.5,
+    "age_far":          -0.8,
+    "name_conflict":    -1.0,
+}
+
+# Human phrasing for the flag's `reason`, richest evidence first.
+_NM1_PHRASE = {
+    "aadhaar": "same Aadhaar reference (near-certain)",
+    "dob_exact": "identical verified DOB",
+    "relation_epic": "same parent/relation EPIC",
+    "name_exact": "verified names identical",
+    "mobile": "same non-shared mobile",
+    "name_strong": "verified names near-identical",
+    "dob_placeholder": "same default (01-Jan) DOB",
+    "name_phonetic": "names sound identical",
+    "father_name_match": "same father/guardian",
+    "mother_name_match": "same mother",
+    "spouse_name_match": "same spouse",
+    "name_weak": "verified names similar",
+    "age_exact": "identical age",
+    "same_house": "same house & constituency",
+    "dob_year": "same birth year",
+    "age_close": "near-identical age",
+    "mobile_shared": "same (shared) mobile",
+    "gender_same": "same gender",
+}
+_NM1_COUNTER = {
+    "dob_conflict": "different birth dates",
+    "aadhaar_conflict": "different Aadhaar reference",
+    "gender_diff": "different gender",
+    "relation_conflict": "different parent EPIC",
+    "age_far": "ages far apart",
+    "name_conflict": "verified names differ",
+}
+
+# The columns new_model_1 scores on — verified fields first, roll fields as
+# fallback / corroboration.
+_NM1_COLS = (
+    "id, epic_no, name, verified_name, gender, age, verified_age, "
+    "verified_dob, mobile_no, aadhaar_ref_no, relation_epic, "
+    "father_or_guardian_name, mother_name, spouse_name, "
+    "house_norm, constituency_no"
+)
+
+# Blocking: build the candidate pairs cheaply from five indexed keys, union
+# them, and score the union. Each key is a way two records of the SAME person
+# can be found; scoring then decides. All comparisons stay WITHIN one year and
+# require a DIFFERENT EPIC (same-EPIC duplicates are dup_epic's job).
+_NM1_CANDIDATES_SQL = f"""
+WITH shared_mobiles AS (
+    SELECT mobile_no
+      FROM voters
+     WHERE year = %(year)s AND coalesce(mobile_no,'') <> ''
+     GROUP BY mobile_no
+    HAVING count(DISTINCT epic_no) > %(mobcap)s
+),
+pairs AS (
+    -- B1: same Aadhaar reference
+    SELECT a.id AS aid, b.id AS bid
+      FROM voters a JOIN voters b
+        ON a.aadhaar_ref_no = b.aadhaar_ref_no AND a.id < b.id
+       AND a.year = %(year)s AND b.year = %(year)s
+       AND coalesce(a.aadhaar_ref_no,'') <> ''
+       AND a.epic_no IS DISTINCT FROM b.epic_no
+    UNION
+    -- B2: same real (non-placeholder) verified DOB
+    SELECT a.id, b.id
+      FROM voters a JOIN voters b
+        ON a.verified_dob = b.verified_dob AND a.id < b.id
+       AND a.year = %(year)s AND b.year = %(year)s
+       AND coalesce(a.verified_dob,'') <> '' AND a.verified_dob NOT LIKE '%%-01-01'
+       AND a.epic_no IS DISTINCT FROM b.epic_no
+    UNION
+    -- B3: same mobile, excluding shared/booth numbers
+    SELECT a.id, b.id
+      FROM voters a JOIN voters b
+        ON a.mobile_no = b.mobile_no AND a.id < b.id
+       AND a.year = %(year)s AND b.year = %(year)s
+       AND coalesce(a.mobile_no,'') <> ''
+       AND a.mobile_no NOT IN (SELECT mobile_no FROM shared_mobiles)
+       AND a.epic_no IS DISTINCT FROM b.epic_no
+    UNION
+    -- B4: same parent/relation EPIC
+    SELECT a.id, b.id
+      FROM voters a JOIN voters b
+        ON a.relation_epic = b.relation_epic AND a.id < b.id
+       AND a.year = %(year)s AND b.year = %(year)s
+       AND coalesce(a.relation_epic,'') <> ''
+       AND a.epic_no IS DISTINCT FROM b.epic_no
+    UNION
+    -- B5: same name phonetic key, within an age window (catches OCR/spelling
+    -- drift the exact keys above miss)
+    SELECT a.id, b.id
+      FROM voters a JOIN voters b
+        ON a.name_phonetic = b.name_phonetic AND a.id < b.id
+       AND a.year = %(year)s AND b.year = %(year)s
+       AND a.name_phonetic <> ''
+       AND abs(coalesce(a.age,0) - coalesce(b.age,0)) <= %(win)s
+       AND a.epic_no IS DISTINCT FROM b.epic_no
+)
+SELECT DISTINCT aid, bid FROM pairs
+"""
+
+
+def _nm1_name(v: dict) -> tuple[str, str]:
+    """The name to match on: the ECINET verified name if we have it, else the
+    roll (OCR) name — plus which source it came from, for the flag."""
+    vn = (v.get("verified_name") or "").strip()
+    if vn:
+        return vn, "ecinet_verified"
+    return (v.get("name") or "").strip(), "roll_ocr"
+
+
+def _nm1_is_placeholder_dob(d: str) -> bool:
+    return bool(d) and d.strip().endswith("-01-01")
+
+
+def _nm1_score(a: dict, b: dict, mobile_share: dict) -> tuple[float, list[dict]]:
+    """Sum the evidence for 'a and b are the same person'. Returns the total
+    points and the list of signals that fired (each a dict recording its own
+    contribution) — that list is the flag's explanation."""
+    sig: list[dict] = []
+    pts = 0.0
+
+    def add(name: str, points: float, **extra):
+        nonlocal pts
+        pts += points
+        sig.append({"signal": name, "points": round(points, 2), **extra})
+
+    # ---- name (verified preferred) -----------------------------------
+    an, asrc = _nm1_name(a)
+    bn, bsrc = _nm1_name(b)
+    an_n, bn_n = norm_name(an), norm_name(bn)
+    if an_n and bn_n:
+        if an_n == bn_n:
+            add("name_exact", _NM1_W["name_exact"], a=an, b=bn)
+        else:
+            sim = _cosine(_trigrams(an_n), _trigrams(bn_n))
+            if sim >= NM1_NAME_STRONG_SIM:
+                add("name_strong", _NM1_W["name_strong"], a=an, b=bn, sim=round(sim, 3))
+            elif phonetic(an) and phonetic(an) == phonetic(bn):
+                add("name_phonetic", _NM1_W["name_phonetic"], a=an, b=bn, sim=round(sim, 3))
+            elif sim >= NM1_NAME_WEAK_SIM:
+                add("name_weak", _NM1_W["name_weak"], a=an, b=bn, sim=round(sim, 3))
+            else:
+                add("name_conflict", _NM1_P["name_conflict"], a=an, b=bn, sim=round(sim, 3))
+
+    # ---- date of birth (quality-aware) / age fallback ----------------
+    da = (a.get("verified_dob") or "").strip()
+    db_ = (b.get("verified_dob") or "").strip()
+    if da and db_:
+        if da == db_:
+            if _nm1_is_placeholder_dob(da):
+                add("dob_placeholder", _NM1_W["dob_placeholder"], value=da)
+            else:
+                add("dob_exact", _NM1_W["dob_exact"], value=da)
+        else:
+            ph = _nm1_is_placeholder_dob(da) or _nm1_is_placeholder_dob(db_)
+            ya, yb = da[:4], db_[:4]
+            if ph and ya == yb:
+                add("dob_year", _NM1_W["dob_year"], a=da, b=db_)
+            elif not ph:
+                add("dob_conflict", _NM1_P["dob_conflict"], a=da, b=db_)
+    else:  # no DOB on at least one side -> lean on age
+        aa = a.get("verified_age") if a.get("verified_age") is not None else a.get("age")
+        ba = b.get("verified_age") if b.get("verified_age") is not None else b.get("age")
+        if aa is not None and ba is not None:
+            diff = abs(int(aa) - int(ba))
+            if diff == 0:
+                add("age_exact", _NM1_W["age_exact"], a=aa, b=ba)
+            elif diff <= 2:
+                add("age_close", _NM1_W["age_close"], a=aa, b=ba)
+            elif diff >= 8:
+                add("age_far", _NM1_P["age_far"], a=aa, b=ba)
+
+    # ---- Aadhaar reference (value never exposed; only agree/disagree) --
+    aad_a = (a.get("aadhaar_ref_no") or "").strip()
+    aad_b = (b.get("aadhaar_ref_no") or "").strip()
+    if aad_a and aad_b:
+        if aad_a == aad_b:
+            add("aadhaar", _NM1_W["aadhaar"])
+        else:
+            add("aadhaar_conflict", _NM1_P["aadhaar_conflict"])
+
+    # ---- mobile (shared numbers discounted; value not exposed) --------
+    ma = (a.get("mobile_no") or "").strip()
+    mb = (b.get("mobile_no") or "").strip()
+    if ma and mb and ma == mb:
+        n = mobile_share.get(ma, 1)
+        if n > NM1_MOBILE_SHARE_CAP:
+            add("mobile_shared", _NM1_W["mobile_shared"], shared_across_epics=n)
+        else:
+            add("mobile", _NM1_W["mobile"])
+
+    # ---- parent/relation EPIC ----------------------------------------
+    ra = (a.get("relation_epic") or "").strip()
+    rb = (b.get("relation_epic") or "").strip()
+    if ra and rb:
+        if ra == rb:
+            add("relation_epic", _NM1_W["relation_epic"], epic=ra)
+        else:
+            add("relation_conflict", _NM1_P["relation_conflict"])
+
+    # ---- parent / spouse names ---------------------------------------
+    for col, name, w in (("father_or_guardian_name", "father_name_match", _NM1_W["parent_name"]),
+                         ("mother_name", "mother_name_match", _NM1_W["parent_name"]),
+                         ("spouse_name", "spouse_name_match", _NM1_W["spouse_name"])):
+        x, y = norm_name(a.get(col)), norm_name(b.get(col))
+        if x and y and x == y:
+            add(name, w, value=x)
+
+    # ---- same house in same constituency -----------------------------
+    ha, hb = (a.get("house_norm") or ""), (b.get("house_norm") or "")
+    if ha and ha == hb and (a.get("constituency_no") or "") == (b.get("constituency_no") or ""):
+        add("same_house", _NM1_W["house"], house=ha)
+
+    # ---- gender ------------------------------------------------------
+    ga = (a.get("gender") or "").strip().upper()[:1]
+    gb = (b.get("gender") or "").strip().upper()[:1]
+    if ga and gb:
+        if ga == gb:
+            add("gender_same", _NM1_W["gender_same"])
+        else:
+            add("gender_diff", _NM1_P["gender_diff"], a=ga, b=gb)
+
+    return pts, sig
+
+
+def _nm1_reason(sig: list[dict]) -> str:
+    """A one-line, reviewer-facing explanation built from the signals."""
+    pos = [s["signal"] for s in sig if s["points"] > 0]
+    neg = [s["signal"] for s in sig if s["points"] < 0]
+    pos.sort(key=lambda s: list(_NM1_PHRASE).index(s) if s in _NM1_PHRASE else 99)
+    parts = [_NM1_PHRASE[s] for s in pos if s in _NM1_PHRASE]
+    reason = "Same person suspected — " + "; ".join(parts) if parts else \
+             "Weak duplicate signal"
+    if neg:
+        cnt = [_NM1_COUNTER[s] for s in neg if s in _NM1_COUNTER]
+        if cnt:
+            reason += ".  Counter-evidence: " + "; ".join(cnt)
+    return reason + ".  (Different EPIC on each record.)"
+
+
+def _run_new_model_1(c, year: int) -> None:
+    """Callable rule: score every candidate pair with the identity model and
+    flag those clearing NM1_THRESHOLD, recording the evidence on each flag."""
+    share_rows = c.execute(
+        """SELECT mobile_no, count(DISTINCT epic_no) AS n
+             FROM voters
+            WHERE year = %(year)s AND coalesce(mobile_no,'') <> ''
+            GROUP BY mobile_no""",
+        {"year": year},
+    ).fetchall()
+    mobile_share = {r["mobile_no"]: r["n"] for r in share_rows}
+
+    pairs = c.execute(_NM1_CANDIDATES_SQL,
+                      {"year": year, "mobcap": NM1_MOBILE_SHARE_CAP,
+                       "win": CAND_AGE_WINDOW}).fetchall()
+    if not pairs:
+        return
+
+    ids = {p["aid"] for p in pairs} | {p["bid"] for p in pairs}
+    rows = c.execute(
+        f"SELECT {_NM1_COLS} FROM voters WHERE id = ANY(%s)", (list(ids),)
+    ).fetchall()
+    by_id = {r["id"]: r for r in rows}
+
+    batch = []
+    for p in pairs:
+        a, b = by_id.get(p["aid"]), by_id.get(p["bid"])
+        if not a or not b:
+            continue
+        pts, sig = _nm1_score(a, b, mobile_share)
+        if pts < NM1_THRESHOLD:
+            continue
+        an, asrc = _nm1_name(a)
+        bn, bsrc = _nm1_name(b)
+        sev = "high" if pts >= NM1_HIGH else "medium"
+        # squash the unbounded point total into [0,1] for ordering; the raw
+        # points and a rough match-probability live in details.
+        norm_score = round(min(1.0, pts / 8.0), 3)
+        conf = round(1.0 / (1.0 + 2.0 ** (-(pts - NM1_THRESHOLD))), 3)
+        details = {
+            "method": "new_model_1",
+            "model": "probabilistic identity resolution (Fellegi-Sunter), "
+                     "ECINET-verified",
+            "score_points": round(pts, 2),
+            "match_confidence": conf,
+            "name_a": an, "name_b": bn,
+            "name_source_a": asrc, "name_source_b": bsrc,
+            "epic_a": a["epic_no"], "epic_b": b["epic_no"],
+            "signals": sig,
+            "reason": _nm1_reason(sig),
+        }
+        batch.append((sev, norm_score, a["id"], b["id"], Json(details)))
+
+    if batch:
+        with c.cursor() as cur:
+            cur.executemany(
+                """INSERT INTO flags (rule, severity, score, voter_id,
+                                      related_voter_id, details)
+                   VALUES ('new_model_1', %s, %s, %s, %s, %s)
                    ON CONFLICT DO NOTHING""",
                 batch,
             )
@@ -293,6 +658,17 @@ RULES: dict[str, tuple[str, str, str | Callable]] = {
     "cosine_dup": ("medium",
                    "Cosine method — TF-weighted trigram-vector cosine over the "
                    "full voter profile", _run_cosine),
+
+    # ---- new_model_1: probabilistic identity resolution on the VERIFIED
+    # (ECINET) record — weighs Aadhaar ref, verified DOB (01-Jan defaults
+    # discounted), verified name, mobile (shared numbers discounted), parent
+    # EPIC, parent/spouse names, house, age and gender into one score, and
+    # records the per-signal evidence ('why') on every flag.
+    "new_model_1": ("high",
+                    "new_model_1 — probabilistic identity match over the "
+                    "ECINET-verified record (Aadhaar / verified DOB / verified "
+                    "name / mobile / parent-EPIC), quality-aware, with a "
+                    "per-signal reason on each flag", _run_new_model_1),
 }
 
 
