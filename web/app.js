@@ -1449,6 +1449,9 @@ function discrepancyMatrix(stats) {
     ['Parent>50', 'Parent age gap > 50', s => bc(s).parent_age_over_50],
     ['GParent≤40', 'Grandparent age gap ≤ 40', s => bc(s).grandparent_age_le_40],
     ['Age–DOB>5', 'Roll-age vs DOB-age gap > 5 years', s => bc(s).age_dob_gap],
+    ['Age<18/>105', 'Roll age below 18 or above 105', s => bc(s).age_outlier],
+    ['Aadhaar reuse', 'Same Aadhaar reference on another EPIC', s => bc(s).same_aadhaar],
+    ['Photo reuse', 'Same photograph on another EPIC', s => bc(s).photo_reuse],
   ];
   const head = el('tr', {},
     el('th', {}, 'Constituency'),

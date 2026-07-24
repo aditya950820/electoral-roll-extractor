@@ -47,6 +47,10 @@ PARENT_MAX_GAP       = 50     # a parent > this many years older -> suspicious
 GRANDPARENT_MAX_GAP  = 40     # a grandparent <= this many years older -> impossible
 DOB_AGE_GAP_MAX      = 5      # roll age vs DOB-age may differ by at most this
 NO_MAPPING_CATEGORY  = "na"   # ECINET category_type meaning 'not mapped'
+AGE_MIN              = 18     # minimum legal voting age
+AGE_MAX              = 105    # an age above this is implausible (ghost / error)
+PHOTO_REUSE_MAX_EPICS = 12    # a photo shared by more distinct EPICs than this is
+                              # treated as a blank/template scan, not real reuse
 
 _PARENT_CODES = {"FTHR", "MTHR", "FATHER", "MOTHER", "F", "M"}
 _GRANDPARENT_CODES = {"GFTH", "GMTH"}
@@ -60,7 +64,7 @@ _COLS = (
     "category_type, relation_type_code, relation_epic, relation_name_verified, "
     "father_or_guardian_name, mother_name, spouse_name, house_number, house_norm, "
     "constituency_no, constituency_name, part_no, serial_no, mobile_no, "
-    "epic_lookup_status"
+    "epic_lookup_status, aadhaar_ref_no"
 )
 
 
@@ -115,7 +119,7 @@ def _ac_key(v: dict) -> str:
 # ---------------------------------------------------------------- logical checks
 def _logical_findings(v: dict, by_epic: dict, relref: dict,
                       relref_progeny: dict, relref_fathers: dict,
-                      year: int) -> list[dict]:
+                      year: int, aad_map: dict, photo_map: dict) -> list[dict]:
     """Every logical discrepancy that fires for one voter, each as a dict with a
     machine `check`, a `severity`, structured fields, and a human `how`."""
     out: list[dict] = []
@@ -233,7 +237,93 @@ def _logical_findings(v: dict, by_epic: dict, relref: dict,
                         f"inconsistency."),
             })
 
+    # ---- 7. age_outlier: roll age below 18 or above 105 ---------------------
+    ra = v.get("age")
+    try:
+        ra = int(ra) if ra is not None else None
+    except (TypeError, ValueError):
+        ra = None
+    if ra is not None and (ra < AGE_MIN or ra > AGE_MAX):
+        under = ra < AGE_MIN
+        out.append({
+            "check": "age_outlier", "severity": "medium",
+            "age": ra, "kind": "under_age" if under else "over_age",
+            "how": (f"Roll age is {ra} — "
+                    + (f"below the minimum voting age of {AGE_MIN}; an under-age "
+                       "elector should not be enrolled."
+                       if under else
+                       f"above {AGE_MAX}, which is implausible and usually a "
+                       "data error or a ghost elector.")),
+        })
+
+    # ---- 8. same_aadhaar: this EPIC shares an Aadhaar ref with other EPIC(s) -
+    aad = (v.get("aadhaar_ref_no") or "").strip()
+    if aad and aad in aad_map:
+        my_epic = (v.get("epic_no") or "").strip()
+        partners = [p for p in aad_map[aad]
+                    if (p.get("epic_no") or "").strip()
+                    and (p.get("epic_no") or "").strip() != my_epic]
+        other_epics = sorted({(p.get("epic_no") or "").strip() for p in partners})
+        if other_epics:
+            out.append({
+                "check": "same_aadhaar", "severity": "high",
+                "other_epics": other_epics,
+                "shared_with": [f"{voter_name(p)} ({p.get('epic_no') or 'no EPIC'})"
+                                for p in partners],
+                "how": (f"The same Aadhaar reference is registered on "
+                        f"{len(other_epics) + 1} different EPICs — this one plus "
+                        f"{', '.join(other_epics)}. A shared Aadhaar reference is "
+                        "near-certain proof of one person enrolled more than once."),
+            })
+
+    # ---- 9. photo_reuse: identical stored photograph used on another EPIC ---
+    photo_partners = photo_map.get(v.get("id")) or []
+    if photo_partners:
+        names = [f"{voter_name(p)} ({p.get('epic_no') or 'no EPIC'})"
+                 for p in photo_partners]
+        out.append({
+            "check": "photo_reuse", "severity": "high",
+            "shared_with": names,
+            "how": (f"This voter's photograph has the same image fingerprint as "
+                    f"{len(photo_partners)} other elector(s) on different EPIC(s): "
+                    f"{'; '.join(names)}. A reused photograph is a classic "
+                    "roll-stuffing signal."),
+        })
+
     return out
+
+
+# ---------------------------------------------------------------- photo reuse
+def _photo_reuse_map(c, year: int, by_id: dict) -> dict:
+    """voter_id -> list of OTHER voters (different EPIC) whose stored roll photo
+    has the same perceptual hash. A phash shared by an implausibly large group
+    is a blank/template scan artifact, not genuine reuse, so it is dropped."""
+    rows = c.execute(
+        "SELECT p.voter_id AS vid, p.phash AS phash "
+        "FROM photos p JOIN voters v ON v.id = p.voter_id "
+        "WHERE v.year = %s AND p.phash IS NOT NULL", (year,)).fetchall()
+    by_phash: dict = defaultdict(list)
+    for r in rows:
+        by_phash[r["phash"]].append(r["vid"])
+
+    out: dict = defaultdict(list)
+    for _phash, vids in by_phash.items():
+        epics = {(by_id.get(x, {}).get("epic_no") or "").strip() for x in vids}
+        epics.discard("")
+        if len(epics) < 2 or len(epics) > PHOTO_REUSE_MAX_EPICS:
+            continue
+        for vid in vids:
+            v = by_id.get(vid)
+            if not v:
+                continue
+            my_epic = (v.get("epic_no") or "").strip()
+            partners = [by_id[o] for o in vids
+                        if o != vid and by_id.get(o)
+                        and (by_id[o].get("epic_no") or "").strip()
+                        and (by_id[o].get("epic_no") or "").strip() != my_epic]
+            if partners:
+                out[vid] = partners
+    return dict(out)
 
 
 # ---------------------------------------------------------------- duplicates
@@ -331,9 +421,10 @@ def build_combined(year: int, constituency: str | None = None) -> list[dict]:
     with connect() as c:
         rows = c.execute(f"SELECT {_COLS} FROM voters WHERE year = %s",
                          (year,)).fetchall()
+        by_id = {r["id"]: r for r in rows}
         dupmap = _dup_map(c, year)
+        photo_map = _photo_reuse_map(c, year, by_id)
 
-    by_id = {r["id"]: r for r in rows}
     by_epic: dict[str, dict] = {}
     for r in rows:
         e = (r.get("epic_no") or "").strip()
@@ -356,12 +447,23 @@ def build_combined(year: int, constituency: str | None = None) -> list[dict]:
                                         if norm_name(x.get("father_or_guardian_name"))}))
         for rel, g in relref.items()}
 
+    # Aadhaar references registered on >= 2 distinct EPICs (same person twice).
+    # The value itself is never surfaced — only the fact and the other EPICs.
+    aad_groups: dict[str, list] = defaultdict(list)
+    for r in rows:
+        a = (r.get("aadhaar_ref_no") or "").strip()
+        if a:
+            aad_groups[a].append(r)
+    aad_map = {a: g for a, g in aad_groups.items()
+               if len({(x.get("epic_no") or "").strip() for x in g
+                       if (x.get("epic_no") or "").strip()}) >= 2}
+
     records: list[dict] = []
     for r in rows:
         if constituency and _ac_key(r) != constituency:
             continue
         logical = _logical_findings(r, by_epic, relref, relref_progeny,
-                                    relref_fathers, year)
+                                    relref_fathers, year, aad_map, photo_map)
         no_mapping = ((r.get("category_type") or "").strip().lower()
                       == NO_MAPPING_CATEGORY)
         d = dupmap.get(r["id"])
