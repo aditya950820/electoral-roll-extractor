@@ -1378,6 +1378,77 @@ async function viewCombined(view) {
     })
     .catch(e => { clear(breakHost); breakHost.appendChild(emptyState('⚠', 'Could not load counts', e.detail || e.message)); });
 
+  // ---- browse & simple export by flag type ----
+  const flagOpts = [
+    { value: '', label: 'All flags' },
+    { value: 'cosine', label: 'cosine_new duplicate' },
+    { value: 'fuzzy', label: 'fuzzy_new duplicate' },
+    { value: 'nomap', label: 'No category mapping (na)' },
+    { value: 'logical', label: 'Any logical discrepancy' },
+    { value: 'progeny_overload', label: 'Progeny ≥ 6' },
+    { value: 'father_name_conflict', label: 'Father-name conflict' },
+    { value: 'parent_age_under_15', label: 'Parent age gap < 15' },
+    { value: 'parent_age_over_50', label: 'Parent age gap > 50' },
+    { value: 'grandparent_age_le_40', label: 'Grandparent age gap ≤ 40' },
+    { value: 'age_dob_gap', label: 'Roll-age vs DOB-age gap > 5' },
+    { value: 'age_outlier', label: 'Age < 18 or > 105' },
+    { value: 'same_aadhaar', label: 'Shared Aadhaar reference' },
+    { value: 'photo_reuse', label: 'Reused photograph' },
+  ];
+  const flagSel = selectEl(flagOpts, '', null, {});
+  const flagAcSel = selectEl([{ value: '', label: 'All constituencies' }].concat((summary.constituencies || []).map(a => ({ value: a, label: 'AC ' + a }))), '', null, {});
+  const flagTop = el('input', { type: 'number', min: '1', placeholder: 'all', style: 'width:90px' });
+  const flagListHost = el('div', {});
+
+  const flagQS = () => {
+    const p = new URLSearchParams({ year: state.year });
+    if (flagSel.value) p.set('flag', flagSel.value);
+    if (flagAcSel.value) p.set('ac', flagAcSel.value);
+    if (flagTop.value) p.set('limit', flagTop.value);
+    return p.toString();
+  };
+
+  const loadFlagList = async () => {
+    clear(flagListHost); flagListHost.appendChild(loadingRow('Loading voters…'));
+    const p = new URLSearchParams({ year: state.year, limit: 25, offset: 0 });
+    if (flagSel.value) p.set('signal', flagSel.value);
+    if (flagAcSel.value) p.set('ac', flagAcSel.value);
+    let d;
+    try { d = await api('/api/suspects?' + p.toString()); }
+    catch (e) { clear(flagListHost); flagListHost.appendChild(emptyState('⚠', 'Could not load', e.detail || e.message)); return; }
+    clear(flagListHost);
+    flagListHost.appendChild(el('div', { class: 'small dim mb' },
+      `${fmtNum(d.total)} voter(s) match — showing first ${d.records.length}. The summary PDF covers the full set (add a Top-N to cap it).`));
+    if (!d.records.length) { flagListHost.appendChild(el('div', { class: 'small dim' }, 'No voters for this flag / constituency.')); return; }
+    const tb = el('tbody', {});
+    d.records.forEach((r, i) => tb.appendChild(el('tr', {},
+      el('td', { class: 'mono' }, String(i + 1)),
+      el('td', {}, r.name || '?'),
+      el('td', { class: 'mono' }, r.epic_no || '—'),
+      el('td', { class: 'mono' }, `${r.constituency_no || '?'}/${r.part_no || '?'}/${r.serial_no != null ? r.serial_no : '?'}`),
+      el('td', {}, `${r.age != null ? r.age : '?'} · ${r.gender || '?'}`),
+      el('td', { class: 'small' }, r.signals_summary || ''))));
+    flagListHost.appendChild(el('div', { style: 'overflow:auto;max-height:360px;border:1px solid var(--line-soft);border-radius:var(--radius-sm)' },
+      el('table', { class: 'data' },
+        el('thead', {}, el('tr', {},
+          el('th', {}, '#'), el('th', {}, 'Name (ECINET)'), el('th', {}, 'EPIC'),
+          el('th', {}, 'AC/Part/Serial'), el('th', {}, 'Age·Sex'), el('th', {}, 'Flags'))),
+        tb)));
+  };
+
+  host.appendChild(el('div', { class: 'panel pad mb' },
+    el('div', { style: 'font-weight:700;font-size:15px;margin-bottom:2px' }, 'Browse & simple export by flag type'),
+    el('div', { class: 'small dim', style: 'margin-bottom:10px' }, 'Pick a flag type to see the matching voters, then download a light PDF — basic details, roll photo and the discrepancy explanation / duplicate comparison (like the fuzzy_new / cosine_new report), not the full dossier.'),
+    el('div', { class: 'wrap-flex mb' },
+      field('Flag type', flagSel), field('Constituency', flagAcSel),
+      field('Top-N (blank = all)', flagTop),
+      el('button', { class: 'btn', onclick: loadFlagList, style: 'align-self:end' }, '🔎 Show voters'),
+      el('button', { class: 'btn primary', onclick: () => download('/api/reports/combined_summary.pdf?' + flagQS()), style: 'align-self:end' }, '⬇ Download summary PDF')),
+    flagListHost));
+  flagSel.addEventListener('change', loadFlagList);
+  flagAcSel.addEventListener('change', loadFlagList);
+  loadFlagList();
+
   // shared scope controls — nothing is built until a specific part is requested
   const acOptions = [{ value: '', label: 'All constituencies' }].concat((summary.constituencies || []).map(a => ({ value: a, label: 'AC ' + a })));
   const acSel = selectEl(acOptions, '', null, {});

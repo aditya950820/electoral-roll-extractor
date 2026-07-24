@@ -499,6 +499,23 @@ def combined_summary(records: list[dict]) -> dict:
     return s
 
 
+def record_matches_flag(rec: dict, flag: str | None) -> bool:
+    """True if a combined record carries `flag`. Accepts 'all'/None, 'cosine',
+    'fuzzy', 'nomap'/'na', 'logical', or a specific logical check key
+    (progeny_overload, age_outlier, same_aadhaar, photo_reuse, ...)."""
+    if not flag or flag == "all":
+        return True
+    if flag == "cosine":
+        return bool(rec.get("cosine"))
+    if flag == "fuzzy":
+        return bool(rec.get("fuzzy"))
+    if flag in ("nomap", "na", "no_mapping"):
+        return bool(rec.get("no_mapping"))
+    if flag == "logical":
+        return bool(rec.get("logical"))
+    return any(f.get("check") == flag for f in (rec.get("logical") or []))
+
+
 def constituencies_in(records: list[dict]) -> list[str]:
     """Distinct AC codes present in a report, ordered by how many records each
     contributes (largest first) — drives the per-AC export picker."""

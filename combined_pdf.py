@@ -456,6 +456,76 @@ def build_comprehensive_pdf(records: list[dict], year: int,
     return flow.bytes()
 
 
+# ---------------------------------------------------------------- summary (light)
+_FLAG_LABEL = {
+    "cosine": "cosine_new duplicate", "fuzzy": "fuzzy_new duplicate",
+    "nomap": "no category mapping (na)", "logical": "any logical discrepancy",
+    "progeny_overload": "progeny >= 6", "father_name_conflict": "father-name conflict",
+    "parent_age_under_15": "parent age gap < 15", "parent_age_over_50": "parent age gap > 50",
+    "grandparent_age_le_40": "grandparent age gap <= 40",
+    "age_dob_gap": "roll-age vs DOB-age gap > 5", "age_outlier": "age < 18 or > 105",
+    "same_aadhaar": "shared Aadhaar reference", "photo_reuse": "reused photograph",
+}
+
+
+def build_summary_pdf(records: list[dict], year: int, scope_label: str = "",
+                      flag: str | None = None) -> bytes:
+    """Facility 3 — a light per-voter summary: basic voter details, the roll
+    photo, and the discrepancy explanation / duplicate comparison, several
+    voters per page (priority order). Optionally filtered to one flag type."""
+    title = f"Combined Model — flagged voters (summary) — {year}"
+    if scope_label:
+        title += f" — {scope_label}"
+    flow = Flow(title)
+    sub = f"{len(records)} voter(s)"
+    if flag and flag not in ("", "all"):
+        sub += f"  ·  flag: {_FLAG_LABEL.get(flag, flag)}"
+    flow.para(sub + "  ·  basic details, photo and the discrepancy explanation, "
+              "in priority order.", size=8, color=(.3, .3, .3))
+    flow.line()
+
+    photos = roll_photos([r["voter_id"] for r in records]) if records else {}
+
+    for idx, rec in enumerate(records, 1):
+        flow.space(3)
+        flow.para(f"{idx}. {rec['name']}    {rec.get('epic_no') or 'no EPIC'}",
+                  size=9.5, font="hebo", gap=1)
+        flow.para(
+            f"AC {rec.get('constituency_no') or '?'} · Part "
+            f"{rec.get('part_no') or '?'} · Serial "
+            f"{rec.get('serial_no') if rec.get('serial_no') is not None else '?'} "
+            f"· Age {rec.get('age') if rec.get('age') is not None else '?'} "
+            f"· {rec.get('gender') or '?'} · House {rec.get('house_number') or '?'}",
+            size=7.5, color=(.35, .35, .35), gap=2)
+        ph = photos.get(rec["voter_id"])
+        if ph:
+            flow.image(ph, box_w=48, box_h=58, caption="roll photo",
+                       max_side=240, quality=68)
+        for f in rec["logical"]:
+            flow.bullet(f"{_CHECK_LABEL.get(f['check'], f['check'])}: {f['how']}",
+                        size=7.5, tag=_SEV_TAG.get(f["severity"]),
+                        tag_col=_SEV_COL.get(f["severity"], (0, 0, 0)))
+        if rec["no_mapping"]:
+            flow.bullet("No category mapping: ECINET category_type = 'na' — not "
+                        "mapped to a self/progeny entry.", size=7.5, tag="LOW",
+                        tag_col=_SEV_COL["low"])
+        for key, lbl in (("cosine", "cosine_new"), ("fuzzy", "fuzzy_new")):
+            for d in rec[key]:
+                metric = d.get("metric")
+                metric = metric if metric is not None else d.get("score")
+                flow.bullet(
+                    f"{lbl} duplicate of {d.get('partner_name') or '?'} "
+                    f"({d.get('partner_epic') or 'no EPIC'}) — match {metric}"
+                    + (f"; {d['reason']}" if d.get("reason") else ""),
+                    size=7.5, tag="DUP", tag_col=(.5, .18, .18))
+                flow.comparison_table(d.get("comparison") or [])
+        flow.line(color=(.82, .82, .88), width=.5, gap=6)
+
+    if not records:
+        flow.para("No voters match this flag / scope.", size=10)
+    return flow.bytes()
+
+
 # ---------------------------------------------------------------- dossier
 def _voter_all_data(flow: Flow, epic: str, rows_by_epic: dict):
     """Every stored voter row (per year) + the ECINET enrichment, in full."""

@@ -336,19 +336,13 @@ async def api_suspects(
     records = _cached_records(year)  # raises 409 if not built
 
     ql = (q or "").strip().lower()
+    from combined_model import record_matches_flag
 
     def matches(r: dict) -> bool:
         if severity and r.get("severity") != severity:
             return False
-        if signal:
-            if signal == "cosine" and not r.get("cosine"):
-                return False
-            if signal == "fuzzy" and not r.get("fuzzy"):
-                return False
-            if signal == "logical" and not r.get("logical"):
-                return False
-            if signal == "nomap" and not r.get("no_mapping"):
-                return False
+        if signal and not record_matches_flag(r, signal):
+            return False
         if min_matches and (r.get("n_dups") or 0) < min_matches:
             return False
         if ac and (r.get("constituency_no") or "") != ac:
@@ -960,12 +954,15 @@ async def api_reports_flags_zip(
 # The comprehensive report and the dossier both slice the SAME scoped, priority-
 # ordered voter list into <=50-voter parts, so one scope helper keeps the parts-
 # metadata, the per-part PDFs and the whole-ZIP downloads perfectly aligned.
-def _scope_combined_records(records, ac, limit):
+def _scope_combined_records(records, ac, limit, flag=None):
+    from combined_model import record_matches_flag
     recs = records
     scope = "all constituencies"
     if ac:
         recs = [r for r in recs if (r.get("constituency_no") or "") == ac]
         scope = f"AC {ac}"
+    if flag and flag != "all":
+        recs = [r for r in recs if record_matches_flag(r, flag)]
     if limit:
         recs = recs[:limit]
         if not ac:
@@ -1099,6 +1096,31 @@ async def api_reports_combined_dossier_part(
     data = await db_call(work)
     return _pdf_response(
         data, f"combined_dossier_{year}_{ac or 'all'}_part{part:02d}.pdf")
+
+
+@app.get("/api/reports/combined_summary.pdf")
+async def api_reports_combined_summary(
+    year: int,
+    flag: str | None = None,
+    ac: str | None = None,
+    limit: int | None = None,
+    user: str = Depends(webauth.require_auth),
+):
+    """Facility 3 — a light per-voter summary PDF (basic details + roll photo +
+    the discrepancy explanation / duplicate comparison), optionally filtered to
+    one flag type. Meant as the quick, low-weight export next to the heavy
+    comprehensive report and full dossier."""
+    records = _cached_records(year)  # 409 if not built
+
+    def work():
+        from combined_pdf import build_summary_pdf
+        recs, scope = _scope_combined_records(records, ac, limit, flag=flag)
+        return build_summary_pdf(recs, year, scope_label=scope, flag=flag)
+
+    data = await db_call(work)
+    tag = (flag or "all").replace("/", "-")
+    return _pdf_response(
+        data, f"combined_flagged_{year}_{ac or 'all'}_{tag}.pdf")
 
 
 # --------------------------------------------------------------------------- #
