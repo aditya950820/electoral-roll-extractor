@@ -918,28 +918,63 @@ async def api_reports_flags_zip(
     return _zip_response(data, f"fraud_flags_{year}_by_constituency.zip")
 
 
-@app.get("/api/reports/combined_comprehensive.zip")
-async def api_reports_combined_comprehensive(
+# --- Combined-model report exports -----------------------------------------
+# The comprehensive report and the dossier both slice the SAME scoped, priority-
+# ordered voter list into <=50-voter parts, so one scope helper keeps the parts-
+# metadata, the per-part PDFs and the whole-ZIP downloads perfectly aligned.
+def _scope_combined_records(records, ac, limit):
+    recs = records
+    scope = "all constituencies"
+    if ac:
+        recs = [r for r in recs if (r.get("constituency_no") or "") == ac]
+        scope = f"AC {ac}"
+    if limit:
+        recs = recs[:limit]
+        if not ac:
+            scope = f"top {limit}"
+    return recs, scope
+
+
+@app.get("/api/reports/combined_parts")
+async def api_reports_combined_parts(
     year: int,
     ac: str | None = None,
-    top: int | None = None,
+    limit: int | None = None,
     per_file: int = 50,
     user: str = Depends(webauth.require_auth),
 ):
+    """Part index for the combined-model exports: how the scoped voters split
+    into <=50-voter parts (identical boundaries for report and dossier). Drives
+    the part-by-part download UI so nothing is built until a part is requested."""
     records = _cached_records(year)  # 409 if not built
-    per_file = max(1, min(per_file, 50))  # at most 50 voters per PDF
+    per_file = max(1, min(per_file, 50))
+    recs, scope = _scope_combined_records(records, ac, limit)
+    n = len(recs)
+    parts = [
+        {"part": p + 1,
+         "from": p * per_file + 1,
+         "to": min((p + 1) * per_file, n),
+         "count": min((p + 1) * per_file, n) - p * per_file}
+        for p in range((n + per_file - 1) // per_file)
+    ]
+    return {"per_file": per_file, "total": n, "scope": scope, "parts": parts}
+
+
+@app.get("/api/reports/combined_comprehensive.zip")
+async def api_reports_combined_comprehensive_zip(
+    year: int,
+    ac: str | None = None,
+    limit: int | None = None,
+    per_file: int = 50,
+    user: str = Depends(webauth.require_auth),
+):
+    """Whole comprehensive report as a ZIP of <=50-voter PDFs (download-all)."""
+    records = _cached_records(year)  # 409 if not built
+    per_file = max(1, min(per_file, 50))
 
     def work():
         from combined_pdf import build_comprehensive_zip_chunked
-        recs = records
-        if ac:
-            recs = [r for r in recs if (r.get("constituency_no") or "") == ac]
-            scope = f"AC {ac}"
-        elif top:
-            recs = recs[:top]
-            scope = f"top {top}"
-        else:
-            scope = "all constituencies"
+        recs, scope = _scope_combined_records(records, ac, limit)
         return build_comprehensive_zip_chunked(
             recs, year, per_file=per_file, scope_label=scope)
 
@@ -947,32 +982,85 @@ async def api_reports_combined_comprehensive(
     return _zip_response(data, f"combined_comprehensive_{year}_{ac or 'all'}.zip")
 
 
-@app.get("/api/reports/combined_dossier.zip")
-async def api_reports_combined_dossier(
+@app.get("/api/reports/combined_comprehensive.pdf")
+async def api_reports_combined_comprehensive_part(
     year: int,
+    part: int,
     ac: str | None = None,
-    count: int | None = None,
+    limit: int | None = None,
     per_file: int = 50,
     user: str = Depends(webauth.require_auth),
 ):
+    """One part (<=50 voters) of the comprehensive report as a single PDF — the
+    part-by-part download that avoids building the whole report at once."""
     records = _cached_records(year)  # 409 if not built
-    per_file = max(1, min(per_file, 50))  # at most 50 voters per PDF
+    per_file = max(1, min(per_file, 50))
+    part = max(1, part)
+
+    def work():
+        from combined_pdf import build_comprehensive_pdf
+        recs, scope = _scope_combined_records(records, ac, limit)
+        chunk = recs[(part - 1) * per_file: part * per_file]
+        lo = (part - 1) * per_file + 1
+        hi = lo + len(chunk) - 1
+        label = f"{scope} — part {part} (rank {lo}-{hi})"
+        return build_comprehensive_pdf(chunk, year, scope_label=label,
+                                       start_index=lo)
+
+    data = await db_call(work)
+    return _pdf_response(
+        data, f"combined_comprehensive_{year}_{ac or 'all'}_part{part:02d}.pdf")
+
+
+@app.get("/api/reports/combined_dossier.zip")
+async def api_reports_combined_dossier_zip(
+    year: int,
+    ac: str | None = None,
+    limit: int | None = None,
+    per_file: int = 50,
+    user: str = Depends(webauth.require_auth),
+):
+    """Whole dossier as a ZIP of <=50-voter PDFs (download-all)."""
+    records = _cached_records(year)  # 409 if not built
+    per_file = max(1, min(per_file, 50))
 
     def work():
         from combined_pdf import build_dossier_zip
-        recs = records
-        if ac:
-            recs = [r for r in recs if (r.get("constituency_no") or "") == ac]
-            scope = f"AC {ac}"
-        else:
-            scope = ""
-        if count:
-            recs = recs[:count]
+        recs, scope = _scope_combined_records(records, ac, limit)
         return build_dossier_zip(recs, year, per_file=per_file,
-                                 scope_label=scope)
+                                 scope_label=scope if ac else "")
 
     data = await db_call(work)
     return _zip_response(data, f"combined_dossier_{year}_{ac or 'all'}.zip")
+
+
+@app.get("/api/reports/combined_dossier.pdf")
+async def api_reports_combined_dossier_part(
+    year: int,
+    part: int,
+    ac: str | None = None,
+    limit: int | None = None,
+    per_file: int = 50,
+    user: str = Depends(webauth.require_auth),
+):
+    """One part (<=50 voters) of the full dossier as a single PDF — part-by-part
+    download so an image-heavy dossier never builds the whole set at once."""
+    records = _cached_records(year)  # 409 if not built
+    per_file = max(1, min(per_file, 50))
+    part = max(1, part)
+
+    def work():
+        from combined_pdf import build_dossier_pdf
+        recs, scope = _scope_combined_records(records, ac, limit)
+        chunk = recs[(part - 1) * per_file: part * per_file]
+        lo = (part - 1) * per_file + 1
+        return build_dossier_pdf(chunk, year,
+                                 scope_label=f"{scope} — part {part}",
+                                 start_index=lo)
+
+    data = await db_call(work)
+    return _pdf_response(
+        data, f"combined_dossier_{year}_{ac or 'all'}_part{part:02d}.pdf")
 
 
 # --------------------------------------------------------------------------- #

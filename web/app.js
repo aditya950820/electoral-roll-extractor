@@ -1363,36 +1363,80 @@ async function viewCombined(view) {
     statCard('Low', s.low || 0, 'low'),
   ));
 
-  // shared scope controls
+  // shared scope controls — nothing is built until a specific part is requested
   const acOptions = [{ value: '', label: 'All constituencies' }].concat((summary.constituencies || []).map(a => ({ value: a, label: 'AC ' + a })));
   const acSel = selectEl(acOptions, '', null, {});
-  const topInput = el('input', { type: 'number', min: '1', placeholder: 'all in scope', style: 'width:130px' });
+  const topInput = el('input', { type: 'number', min: '1', placeholder: 'all in scope', style: 'width:120px' });
+  const perPartInput = el('input', { type: 'number', min: '1', max: '50', value: '50', style: 'width:90px' });
+  const partsHost = el('div', {});
+
+  const clampPer = () => { const v = Math.max(1, Math.min(parseInt(perPartInput.value || '50', 10) || 50, 50)); perPartInput.value = v; return v; };
+  const scopeQS = (extra) => {
+    const p = new URLSearchParams({ year: state.year });
+    if (acSel.value) p.set('ac', acSel.value);
+    if (topInput.value) p.set('limit', topInput.value);
+    p.set('per_file', clampPer());
+    if (extra) for (const [k, v] of Object.entries(extra)) p.set(k, v);
+    return p.toString();
+  };
+
+  const loadParts = async () => {
+    clear(partsHost); partsHost.appendChild(loadingRow('Computing parts…'));
+    let meta;
+    try { meta = await api('/api/reports/combined_parts?' + scopeQS()); }
+    catch (e) { clear(partsHost); partsHost.appendChild(emptyState('⚠', 'Could not compute parts', e.detail || e.message)); return; }
+    clear(partsHost);
+    partsHost.appendChild(el('div', { class: 'small dim mb' },
+      `${fmtNum(meta.total)} voter(s) in scope → ${meta.parts.length} part(s) of ≤${meta.per_file}. Download each part on its own (fast), or grab everything as one ZIP.`));
+    partsHost.appendChild(facilityPanel(
+      'Facility 1 — Comprehensive report',
+      'Every flagged voter with all findings, methods, reasons and the full duplicate-comparison logic, in priority order.',
+      () => download('/api/reports/combined_comprehensive.zip?' + scopeQS()),
+      meta.parts, (part) => download('/api/reports/combined_comprehensive.pdf?' + scopeQS({ part }))));
+    partsHost.appendChild(facilityPanel(
+      'Facility 2 — Full dossier',
+      'A complete case file per voter — every stored data point, every photo, the EF form rendered large — plus the same for each cosine/fuzzy duplicate. Image-heavy: prefer downloading parts one at a time.',
+      () => download('/api/reports/combined_dossier.zip?' + scopeQS()),
+      meta.parts, (part) => download('/api/reports/combined_dossier.pdf?' + scopeQS({ part }))));
+  };
 
   host.appendChild(el('div', { class: 'panel pad mb wrap-flex' },
     field('Constituency', acSel),
     field('Top-N voters (blank = all)', topInput),
-    el('div', { class: 'small dim', style: 'align-self:center;max-width:340px' },
-      'Priority order: fuzzy/cosine duplicates → logical discrepancy → no-mapping. Every export is split into PDFs of at most 50 voters (part 01 = strongest leads).')));
+    field('Voters per part (≤50)', perPartInput),
+    el('button', { class: 'btn primary', onclick: loadParts, style: 'align-self:end' }, '↻ Refresh parts'),
+    el('div', { class: 'small dim', style: 'flex-basis:100%' },
+      'Priority order: fuzzy/cosine duplicates → logical discrepancy → no-mapping. Part 01 = strongest leads. Nothing is built until you download a part.')));
 
-  const dl = (base, topKey) => {
-    const p = new URLSearchParams({ year: state.year });
-    if (acSel.value) p.set('ac', acSel.value);
-    if (topInput.value) p.set(topKey, topInput.value);
-    return base + '?' + p.toString();
-  };
-
-  host.appendChild(el('div', { class: 'grid cols-2' },
-    reportCard('Facility 1 — Comprehensive report (ZIP)',
-      'Every flagged voter with all findings, methods, reasons and the full duplicate-comparison logic, in priority order. Split into PDFs of ≤50 voters.',
-      () => download(dl('/api/reports/combined_comprehensive.zip', 'top'))),
-    reportCard('Facility 2 — Full dossier (ZIP)',
-      'A complete case file per voter — every stored data point, every photo, and the EF form rendered large — plus the same full record for each cosine/fuzzy duplicate. Split into PDFs of ≤50 voters.',
-      () => download(dl('/api/reports/combined_dossier.zip', 'count'))),
-  ));
+  host.appendChild(partsHost);
+  acSel.addEventListener('change', loadParts);
+  loadParts();
 
   host.appendChild(el('div', { class: 'small dim mt' },
     el('span', {}, 'Names come from the ECINET verified record. A flag is a lead, not a verdict. '),
     el('a', { href: '#/suspects' }, 'Browse the full suspect list →')));
+}
+
+function facilityPanel(title, desc, onZip, parts, onPart) {
+  const list = el('div', { style: 'max-height:320px;overflow:auto;display:flex;flex-direction:column;gap:6px;margin-top:10px' });
+  if (!parts.length) {
+    list.appendChild(el('div', { class: 'small dim' }, 'No voters in this scope.'));
+  } else {
+    parts.forEach(pt => list.appendChild(el('div', {
+      style: 'display:flex;align-items:center;justify-content:space-between;gap:10px;padding:6px 10px;border:1px solid var(--line);border-radius:var(--radius-sm);background:var(--surface-2)'
+    },
+      el('span', { class: 'small' },
+        el('b', {}, 'Part ' + String(pt.part).padStart(2, '0')),
+        el('span', { class: 'dim' }, `  ·  voters ${fmtNum(pt.from)}–${fmtNum(pt.to)}  (${pt.count})`)),
+      el('button', { class: 'btn sm', onclick: () => onPart(pt.part) }, '⎙ PDF'))));
+  }
+  return el('div', { class: 'panel pad mb' },
+    el('div', { style: 'font-weight:700;font-size:15px;margin-bottom:4px' }, title),
+    el('div', { class: 'small dim', style: 'margin-bottom:8px' }, desc),
+    el('div', { class: 'row-flex' },
+      el('button', { class: 'btn', onclick: onZip }, '⬇ Download all (ZIP)'),
+      el('span', { class: 'small dim' }, `${parts.length} part(s), ≤50 voters each`)),
+    list);
 }
 
 /* ------------------------------------------------------------------ *
