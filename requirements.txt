@@ -1,4 +1,8 @@
-streamlit>=1.36
+# --- web stack (FastAPI command center) ---
+fastapi>=0.110              # API backend (server.py)
+uvicorn[standard]>=0.27     # ASGI server that runs the app
+python-multipart>=0.0.9     # multipart form parsing (PDF uploads)
+itsdangerous>=2.1           # signs session cookies (Starlette SessionMiddleware)
 mistralai>=1.2,<2   # 2.x reorganizes the package; app uses the 1.x client API
 pymupdf>=1.24
 pandas>=2.0

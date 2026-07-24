@@ -9,7 +9,7 @@ plaintext never leaves your terminal.
 import getpass
 import sys
 
-from auth import hash_password
+from security import hash_password
 
 if __name__ == "__main__":
     pw = getpass.getpass("New password: ")
