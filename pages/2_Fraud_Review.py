@@ -12,8 +12,13 @@ from fraud_rules import (RULES, clear_flags, flag_counts_by_constituency,
                          flag_counts_by_constituency_rule, flag_summary,
                          flagged_constituencies, open_flags, record_review,
                          run_rules)
-from ui_helpers import (build_flags_pdf, build_flags_pdf_zip, flag_card,
-                        flag_title, infinite_limit, infinite_scroll_sentinel)
+from ui_helpers import (build_compare_pdf, build_flags_pdf, build_flags_pdf_zip,
+                        flag_card, flag_title, infinite_limit,
+                        infinite_scroll_sentinel)
+
+# The model rules carry a full per-attribute comparison; their PDF prints that
+# logic and so uses the richer (taller) compare layout.
+_COMPARE_RULES = ("fuzzy_new", "cosine_new")
 
 load_dotenv()
 
@@ -147,10 +152,19 @@ rule_filter = st.selectbox("Filter by rule", ["(all)"] + list(RULES))
 
 _filter = None if rule_filter == "(all)" else rule_filter
 
+# Pick the PDF builder: the model rules get the richer compare layout (full
+# per-attribute logic, ≤5 per page), everything else the standard report.
+_pdf_builder = (build_compare_pdf if rule_filter in _COMPARE_RULES
+                else build_flags_pdf)
+
 # ---------------------------------------------------------------- downloads
 # PDFs embed photos, so they are heavy — build only on click, never on every
 # rerun, and cache the bytes against the exact scope they were built for.
-st.markdown("**Download flag report (PDF — photos, 5 comparisons / page)**")
+if rule_filter in _COMPARE_RULES:
+    st.markdown("**Download comparison report (PDF — voters + full logic, "
+                "≤5 / page)**")
+else:
+    st.markdown("**Download flag report (PDF — photos, 5 comparisons / page)**")
 d_tot, d_ac = st.tabs(["📄 Total (all constituencies)", "🗂️ Constituency-wise"])
 
 with d_tot:
@@ -159,7 +173,7 @@ with d_tot:
                  help="One report covering every constituency for the "
                       "selected year and rule filter."):
         with st.spinner(f"Building {year} total PDF (embedding photos)…"):
-            st.session_state[tot_key] = build_flags_pdf(_filter, year)
+            st.session_state[tot_key] = _pdf_builder(_filter, year)
     if st.session_state.get(tot_key):
         st.download_button(
             "⬇️ Download total PDF",
@@ -180,7 +194,7 @@ with d_ac:
             if st.button(f"🧾 Prepare AC {pick} PDF", key="prep_one",
                          use_container_width=True):
                 with st.spinner(f"Building AC {pick} PDF…"):
-                    st.session_state[one_key] = build_flags_pdf(
+                    st.session_state[one_key] = _pdf_builder(
                         _filter, year, pick)
             if st.session_state.get(one_key):
                 st.download_button(
@@ -199,7 +213,8 @@ with d_ac:
                 st.session_state[zip_key] = build_flags_pdf_zip(
                     _filter, year,
                     progress=lambda i, n, ac: bar.progress(
-                        i / n, text=f"AC {ac} ({i}/{n})"))
+                        i / n, text=f"AC {ac} ({i}/{n})"),
+                    builder=_pdf_builder)
                 bar.empty()
             if st.session_state.get(zip_key):
                 st.download_button(

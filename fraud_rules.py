@@ -11,7 +11,8 @@ below either exclude relation_name or require corroborating fields.
 from __future__ import annotations
 
 import math
-from collections import Counter
+from collections import Counter, defaultdict
+from datetime import date
 from typing import Callable
 
 from psycopg.types.json import Json
@@ -498,17 +499,22 @@ def _run_new_model_1(c, year: int) -> None:
 # flag as a side-by-side {attribute, a, b, similarity, status} row, so a
 # reviewer (and the comparison PDF) can see exactly which fields agreed and
 # which differed, next to each other.
-FUZZY_NEW_THRESHOLD = 0.72   # weighted similarity needed to raise a flag
-FUZZY_NEW_HIGH      = 0.88   # >= this -> 'high' severity
-FUZZY_NEW_MIN_ATTRS = 3      # need at least this many comparable attributes
+FUZZY_NEW_THRESHOLD          = 0.72  # weighted similarity needed to raise a flag
+FUZZY_NEW_NOPROGENY_THRESHOLD = 0.66 # looser bar when a side has no progeny link
+FUZZY_NEW_HIGH              = 0.88   # >= this -> 'high' severity
+FUZZY_NEW_MIN_ATTRS         = 3      # need at least this many comparable attributes
 
 # Relative importance of each attribute in the weighted average. The average is
 # taken only over attributes present on BOTH records, so missing enrichment
 # degrades gracefully instead of dragging every score down.
 _FN_WEIGHTS = {
-    "name": 0.30, "dob": 0.16, "father": 0.12, "mother": 0.10,
-    "progeny_epic": 0.10, "progeny_name": 0.08, "spouse": 0.06,
-    "house": 0.04, "age": 0.02, "gender": 0.02,
+    "name": 0.34, "dob": 0.20, "father": 0.14, "mother": 0.12,
+    "progeny_epic": 0.10, "progeny_name": 0.06, "spouse": 0.02, "age": 0.02,
+    # house and gender carry NO scoring weight: house is low-signal in this
+    # data (overlooked per review), and gender is a hard gate (a duplicate
+    # cannot change gender — see _run_fuzzy_new). Both are still shown, for
+    # information, in the side-by-side comparison.
+    "house": 0.0, "gender": 0.0,
 }
 
 _FN_COLS = (
@@ -589,7 +595,9 @@ def _fn_score(a: dict, b: dict) -> tuple[float, list[dict], int]:
         comp.append({"attribute": label, "a": va, "b": vb,
                      "similarity": None if sim is None else round(sim, 3),
                      "weight": weight, "status": _fn_status(sim)})
-        if sim is not None:
+        # weight 0 attributes (house, gender) are informational only — shown in
+        # the comparison but excluded from the weighted score and the count.
+        if sim is not None and weight > 0:
             wsum += weight
             ssum += weight * sim
             n += 1
@@ -675,6 +683,23 @@ def _fn_has_anchor(comp: list[dict]) -> bool:
     return False
 
 
+def _genders_conflict(a: dict, b: dict) -> bool:
+    """A duplicate is the same person and cannot change gender: two records with
+    different recorded genders are different people. Blank on a side is not a
+    conflict (the record simply lacks the field)."""
+    ga = (a.get("gender") or "").strip().upper()[:1]
+    gb = (b.get("gender") or "").strip().upper()[:1]
+    return bool(ga and gb and ga != gb)
+
+
+def _no_progeny(v: dict) -> bool:
+    """A record with no reference/progeny link — enrolled as 'self'/'na' or with
+    no relation EPIC. Reviewers flagged these as higher duplicate risk, so the
+    models scrutinise them harder (a lower similarity threshold)."""
+    cat = (v.get("category_type") or "").strip().lower()
+    return (not (v.get("relation_epic") or "").strip()) or cat in ("self", "na", "")
+
+
 def _fn_reason(comp: list[dict], composite: float) -> str:
     """One-line summary naming the attributes that agreed and those that
     differed — the same evidence the side-by-side table shows."""
@@ -708,12 +733,20 @@ def _run_fuzzy_new(c, year: int) -> None:
         a, b = by_id.get(p["aid"]), by_id.get(p["bid"])
         if not a or not b:
             continue
+        # gender gate: a duplicate cannot change gender.
+        if _genders_conflict(a, b):
+            continue
         composite, comp, n = _fn_score(a, b)
         # need a comparable name and enough evidence to trust the score
         name_row = comp[0]
         if name_row["similarity"] is None or n < FUZZY_NEW_MIN_ATTRS:
             continue
-        if composite < FUZZY_NEW_THRESHOLD:
+        # no-progeny records are higher duplicate risk -> scrutinise harder with
+        # a lower threshold; everyone else keeps the standard bar.
+        threshold = (FUZZY_NEW_NOPROGENY_THRESHOLD
+                     if (_no_progeny(a) or _no_progeny(b))
+                     else FUZZY_NEW_THRESHOLD)
+        if composite < threshold:
             continue
         # robustness gate: a high score on thin evidence (common name + same
         # house + similar age, no verified corroboration) is a coincidence, not
@@ -765,6 +798,7 @@ def _run_fuzzy_new(c, year: int) -> None:
 # parent-name match) and stores a side-by-side {attribute, a, b, similarity,
 # status} comparison of every field checked, for the comparison PDF.
 COSINE_NEW_THRESHOLD  = 0.80  # combined-profile cosine needed to raise a flag
+COSINE_NEW_NOPROGENY_THRESHOLD = 0.74  # looser bar when a side has no progeny link
 COSINE_NEW_HIGH       = 0.90  # >= this -> 'high' severity
 COSINE_NEW_MIN_ATTRS  = 3
 # A duplicate is the SAME person, so the verified names must actually match.
@@ -776,8 +810,9 @@ COSINE_NEW_NAME_FLOOR = 0.85
 # scaled by its weight before summing). Name and DOB dominate.
 _CN_VEC_W = {
     "name": 3.0, "dob": 2.0, "father": 1.5, "mother": 1.2, "spouse": 0.8,
-    "progeny_epic": 0.6, "house": 0.5, "category": 0.5, "relation_type": 0.4,
-    "gender": 0.3,
+    "progeny_epic": 0.6, "category": 0.5, "relation_type": 0.4, "gender": 0.3,
+    # house dropped from the vector: low-signal in this data (overlooked per
+    # review). Still shown in the side-by-side comparison for information.
 }
 _CN_COLS = (
     "id, epic_no, name, verified_name, gender, age, verified_age, "
@@ -921,10 +956,17 @@ def _run_cosine_new(c, year: int) -> None:
         a, b = by_id.get(p["aid"]), by_id.get(p["bid"])
         if not a or not b:
             continue
+        # gender gate: a duplicate cannot change gender.
+        if _genders_conflict(a, b):
+            continue
         composite, comp, n = _cn_score(a, b, vecs[a["id"]], vecs[b["id"]])
         if comp[0]["similarity"] is None or n < COSINE_NEW_MIN_ATTRS:
             continue
-        if composite < COSINE_NEW_THRESHOLD:
+        # no-progeny records are higher duplicate risk -> looser threshold.
+        threshold = (COSINE_NEW_NOPROGENY_THRESHOLD
+                     if (_no_progeny(a) or _no_progeny(b))
+                     else COSINE_NEW_THRESHOLD)
+        if composite < threshold:
             continue
         # a duplicate must be the same person: the verified names must match
         if comp[0]["similarity"] < COSINE_NEW_NAME_FLOOR:
@@ -960,6 +1002,233 @@ def _run_cosine_new(c, year: int) -> None:
                 """INSERT INTO flags (rule, severity, score, voter_id,
                                       related_voter_id, details)
                    VALUES ('cosine_new', %s, %s, %s, %s, %s)
+                   ON CONFLICT DO NOTHING""",
+                batch,
+            )
+
+
+# =====================================================================
+# family_logic — impossible / suspicious family structures on the progeny graph
+# =====================================================================
+# A separate detector (not a pairwise duplicate model): it walks the whole-roll
+# parent -> child graph built from `relation_epic` (each voter's reference
+# person's EPIC) and flags family structures that cannot / should not occur.
+# One flag per parent EPIC that has any finding, aggregating every issue for
+# that family so a reviewer sees the whole picture:
+#
+#   * progeny_overload      — a parent with >= 6 registered children.
+#   * sibling_gap           — two children of one parent whose real DOBs are
+#                             < ~9 months apart (impossible unless twins, and
+#                             twins share a date, which is excluded).
+#   * parent_age            — a resolved parent < 15 years older than a child
+#                             (impossible) or > 50 years older (suspicious).
+#                             Only computable when the parent is enrolled here.
+#   * father_name_conflict  — children sharing one parent EPIC who list two or
+#                             more different father / guardian names.
+#
+# These are leads, never verdicts — `relation_epic` is noisy and a parent is
+# rarely enrolled in the same roll, so coverage is partial by design.
+FAMILY_PROGENY_MAX      = 6    # a parent with >= this many children is flagged
+FAMILY_SIBLING_GAP_DAYS = 270  # two children born < ~9 months apart (not twins)
+FAMILY_PARENT_MIN_GAP   = 15   # a parent < this many years older than a child
+FAMILY_PARENT_MAX_GAP   = 50   # a parent > this many years older than a child
+
+_FAM_COLS = ("id, epic_no, name, verified_name, verified_dob, verified_age, "
+             "age, gender, relation_epic, father_or_guardian_name, mother_name")
+_SEV_ORDER = {"low": 1, "medium": 2, "high": 3}
+
+
+def _fam_real_dob(s) -> "date | None":
+    """Parse a verified DOB, rejecting the 01-Jan birth-year placeholder."""
+    s = (s or "").strip()
+    if not s or s.endswith("-01-01"):
+        return None
+    try:
+        return date.fromisoformat(s[:10])
+    except ValueError:
+        return None
+
+
+def _fam_age(v: dict | None):
+    if not v:
+        return None
+    a = v.get("verified_age")
+    a = a if a is not None else v.get("age")
+    try:
+        return int(a)
+    except (TypeError, ValueError):
+        return None
+
+
+def _fam_name_clusters(names: list[str], thresh: float = 0.6) -> list[str]:
+    """Collapse near-identical names (OCR / spelling drift) into clusters and
+    return one representative each. Two names counted as 'different' only when
+    they are genuinely dissimilar — so 'RAM KUMAR' vs 'RAMKUMR' is one name."""
+    reps: list[str] = []
+    for nm in names:
+        if not any(_cosine(_trigrams(nm), _trigrams(r)) >= thresh for r in reps):
+            reps.append(nm)
+    return reps
+
+
+def _fam_reason(label: str, n_kids: int, findings: list[dict]) -> str:
+    parts = []
+    for f in findings:
+        ch = f["check"]
+        if ch == "progeny_overload":
+            parts.append(f"{f['children']} children on one parent-pair")
+        elif ch == "father_name_conflict":
+            parts.append(f"{len(f['father_names'])} different father/guardian "
+                         f"names under one household reference "
+                         f"(often a multi-generation household)")
+        elif ch == "sibling_gap":
+            parts.append(f"{len(f['pairs'])} full-sibling pair(s) born "
+                         f"<9 months apart")
+        elif ch == "parent_age":
+            u = sum(1 for i in f["issues"] if i["kind"] == "under_15")
+            o = sum(1 for i in f["issues"] if i["kind"] == "over_50")
+            bits = []
+            if u:
+                bits.append(f"listed parent <15y older than {u} child(ren)")
+            if o:
+                bits.append(f"listed parent >50y older than {o} child(ren)")
+            parts.append("; ".join(bits))
+    return (f"Family-logic discrepancy — {label} ({n_kids} children): "
+            + "; ".join(parts) + ".")
+
+
+def _run_family_logic(c, year: int) -> None:
+    """Flag impossible/suspicious family structures. NOTE on the data: this
+    roll's `relation_epic` is a HOUSEHOLD reference (format AR/AC/part/serial),
+    not a single parent's EPIC — grouping by it mixes generations and cousins.
+    So the 'same parents' checks key on the (father_name, mother_name) pair
+    instead, which is the true sibling set. relation_epic is used only for the
+    father-name-conflict note (and that is why it stays low severity)."""
+    rows = c.execute(f"SELECT {_FAM_COLS} FROM voters WHERE year = %s",
+                     (year,)).fetchall()
+
+    by_epic: dict[str, dict] = {}                   # epic_no -> voter (parent lookup)
+    sib: dict[tuple, list] = defaultdict(list)      # (father, mother) -> children
+    ref: dict[str, list] = defaultdict(list)        # relation_epic -> household
+    for r in rows:
+        e = (r["epic_no"] or "").strip()
+        if e and e not in by_epic:
+            by_epic[e] = r
+        nf, nm = norm_name(r["father_or_guardian_name"]), norm_name(r["mother_name"])
+        if nf and nm:
+            sib[(nf, nm)].append(r)
+        rel = (r["relation_epic"] or "").strip()
+        if rel:
+            ref[rel].append(r)
+
+    batch = []
+    used_reps: set[int] = set()
+
+    def emit(kids: list, label: str, findings: list, sev: str):
+        rep = next((k for k in sorted(kids, key=lambda k: k["id"])
+                    if k["id"] not in used_reps), None)
+        if rep is None:            # every candidate already represents a flag
+            return
+        used_reps.add(rep["id"])
+        score = {"high": 0.9, "medium": 0.6, "low": 0.4}[sev]
+        details = {
+            "method": "family_logic",
+            "group": label,
+            "children": len(kids),
+            "checks": [f["check"] for f in findings],
+            "findings": findings,
+            "reason": _fam_reason(label, len(kids), findings),
+        }
+        batch.append((sev, score, rep["id"], Json(details)))
+
+    # ---- parent-pair checks: progeny_overload, sibling_gap, parent_age ----
+    for (nf, nm), kids in sib.items():
+        findings: list[dict] = []
+        sev = "low"
+
+        def bump(s: str):
+            nonlocal sev
+            if _SEV_ORDER[s] > _SEV_ORDER[sev]:
+                sev = s
+
+        if len(kids) >= FAMILY_PROGENY_MAX:
+            findings.append({"check": "progeny_overload", "children": len(kids)})
+            bump("high" if len(kids) >= 10 else "medium")
+
+        dated = [(k, _fam_real_dob(k["verified_dob"])) for k in kids]
+        dated = [(k, d) for k, d in dated if d]
+        pairs = []
+        for i in range(len(dated)):
+            for j in range(i + 1, len(dated)):
+                gap = abs((dated[i][1] - dated[j][1]).days)
+                if 1 <= gap <= FAMILY_SIBLING_GAP_DAYS:
+                    pairs.append({"a_epic": dated[i][0]["epic_no"],
+                                  "b_epic": dated[j][0]["epic_no"],
+                                  "a_name": _nm1_name(dated[i][0])[0],
+                                  "b_name": _nm1_name(dated[j][0])[0],
+                                  "dob_a": str(dated[i][1]),
+                                  "dob_b": str(dated[j][1]), "gap_days": gap})
+        if pairs:
+            findings.append({"check": "sibling_gap", "pairs": pairs})
+            bump("high")
+
+        if findings:
+            emit(kids, f"parents {nf} & {nm}", findings, sev)
+
+    # ---- household-reference checks (relation_epic). It is a household ref,
+    # not a single parent, so father_name_conflict here mostly surfaces
+    # multi-generation households -> LOW severity, informational. parent_age is
+    # only computed when the reference is an EPIC that resolves to an enrolled
+    # voter (the sole reliable parent link in this data).
+    for rel, kids in ref.items():
+        findings = []
+        sev = "low"
+
+        def bump(s: str):
+            nonlocal sev
+            if _SEV_ORDER[s] > _SEV_ORDER[sev]:
+                sev = s
+
+        fnames = sorted({norm_name(k["father_or_guardian_name"]) for k in kids
+                         if norm_name(k["father_or_guardian_name"])})
+        distinct = _fam_name_clusters(fnames)
+        if len(distinct) >= 2:
+            findings.append({"check": "father_name_conflict",
+                             "father_names": distinct, "reference_id": rel})
+            bump("low")
+
+        parent = by_epic.get(rel)
+        page = _fam_age(parent)
+        if parent is not None and page is not None:
+            issues = []
+            for k in kids:
+                if k["id"] == parent["id"]:
+                    continue
+                cage = _fam_age(k)
+                if cage is None:
+                    continue
+                gap = page - cage
+                if gap < FAMILY_PARENT_MIN_GAP:
+                    issues.append({"child_epic": k["epic_no"], "child_age": cage,
+                                   "parent_age": page, "gap": gap, "kind": "under_15"})
+                elif gap > FAMILY_PARENT_MAX_GAP:
+                    issues.append({"child_epic": k["epic_no"], "child_age": cage,
+                                   "parent_age": page, "gap": gap, "kind": "over_50"})
+            if issues:
+                findings.append({"check": "parent_age",
+                                 "parent": "reference", "parent_name": _nm1_name(parent)[0],
+                                 "issues": issues})
+                bump("high" if any(i["kind"] == "under_15" for i in issues)
+                     else "medium")
+
+        if findings:
+            emit(kids, f"reference {rel}", findings, sev)
+
+    if batch:
+        with c.cursor() as cur:
+            cur.executemany(
+                """INSERT INTO flags (rule, severity, score, voter_id, details)
+                   VALUES ('family_logic', %s, %s, %s, %s)
                    ON CONFLICT DO NOTHING""",
                 batch,
             )
@@ -1174,6 +1443,16 @@ RULES: dict[str, tuple[str, str, str | Callable]] = {
                    "name + DOB + father/mother/spouse + category + progeny + "
                    "house/gender, with a side-by-side attribute comparison on "
                    "each flag", _run_cosine_new),
+
+    # ---- family_logic: impossible/suspicious family structures on the
+    # relation_epic (progeny) graph — parent with >=6 children, siblings born
+    # <9 months apart, parent <15y older or >50y older than a child, and
+    # children of one parent listing different father names.
+    "family_logic": ("medium",
+                     "family_logic — impossible/suspicious family structures "
+                     "on the progeny graph: parent with >=6 children, siblings "
+                     "born <9 months apart, parent-age impossibilities, and "
+                     "conflicting father names under one parent EPIC", _run_family_logic),
 }
 
 
