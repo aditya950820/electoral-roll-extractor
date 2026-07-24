@@ -265,8 +265,11 @@ async def api_suspects_build(request: Request,
 
 
 @app.get("/api/suspects/summary")
-async def api_suspects_summary(year: int,
+async def api_suspects_summary(year: int, ac: str | None = None,
                                user: str = Depends(webauth.require_auth)):
+    """Combined-model headline counts. With `ac` set, the counts are for that
+    constituency only; the `constituencies` list always covers the whole year so
+    the picker stays complete."""
     with _combined_lock:
         entry = _combined_cache.get(int(year))
     if not entry:
@@ -275,11 +278,15 @@ async def api_suspects_summary(year: int,
     def work():
         from combined_model import combined_summary, constituencies_in
         records = entry["records"]
-        return combined_summary(records), constituencies_in(records)
+        constituencies = constituencies_in(records)  # full list for the picker
+        scoped = (records if not ac
+                  else [r for r in records
+                        if (r.get("constituency_no") or "") == ac])
+        return combined_summary(scoped), constituencies
 
     summary, constituencies = await run_in_threadpool(work)
     return jsonable_encoder({"built": True, "built_at": entry["built_at"],
-                             "summary": summary,
+                             "ac": ac, "summary": summary,
                              "constituencies": constituencies})
 
 

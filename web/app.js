@@ -1354,14 +1354,37 @@ async function viewCombined(view) {
     return;
   }
 
-  // summary strip
-  const s = summary.summary || {};
-  host.appendChild(el('div', { class: 'grid cols-4 mb' },
-    statCard('Flagged voters', s.total, 'accent', 'built ' + (summary.built_at ? new Date(summary.built_at).toLocaleString() : '')),
-    statCard('High', s.high || 0, 'high'),
-    statCard('Medium', s.medium || 0, 'medium'),
-    statCard('Low', s.low || 0, 'low'),
-  ));
+  // constituency-wise discrepancy breakdown (defaults to the whole year)
+  const acBreakSel = selectEl(
+    [{ value: '', label: 'All constituencies' }].concat((summary.constituencies || []).map(a => ({ value: a, label: 'AC ' + a }))),
+    '', null, {});
+  const breakHost = el('div', {});
+
+  const renderBreakdown = (sm) => {
+    clear(breakHost);
+    breakHost.appendChild(el('div', { class: 'grid cols-4 mb' },
+      statCard('Flagged voters', sm.total || 0, 'accent'),
+      statCard('High', sm.high || 0, 'high'),
+      statCard('Medium', sm.medium || 0, 'medium'),
+      statCard('Low', sm.low || 0, 'low')));
+    breakHost.appendChild(discrepancyTable(sm));
+  };
+
+  const loadBreakdown = async () => {
+    clear(breakHost); breakHost.appendChild(loadingRow('Loading counts…'));
+    const qs = new URLSearchParams({ year: state.year });
+    if (acBreakSel.value) qs.set('ac', acBreakSel.value);
+    try { const r = await api('/api/suspects/summary?' + qs.toString()); renderBreakdown(r.summary || {}); }
+    catch (e) { clear(breakHost); breakHost.appendChild(emptyState('⚠', 'Could not load counts', e.detail || e.message)); }
+  };
+
+  host.appendChild(el('div', { class: 'panel pad mb' },
+    el('div', { class: 'wrap-flex mb', style: 'justify-content:space-between' },
+      el('div', { style: 'font-weight:700;font-size:15px' }, 'Discrepancy breakdown — count of each type by constituency'),
+      field('Constituency', acBreakSel)),
+    breakHost));
+  acBreakSel.addEventListener('change', loadBreakdown);
+  renderBreakdown(summary.summary || {});
 
   // shared scope controls — nothing is built until a specific part is requested
   const acOptions = [{ value: '', label: 'All constituencies' }].concat((summary.constituencies || []).map(a => ({ value: a, label: 'AC ' + a })));
@@ -1415,6 +1438,48 @@ async function viewCombined(view) {
   host.appendChild(el('div', { class: 'small dim mt' },
     el('span', {}, 'Names come from the ECINET verified record. A flag is a lead, not a verdict. '),
     el('a', { href: '#/suspects' }, 'Browse the full suspect list →')));
+}
+
+/* Count of each discrepancy type for the current scope, as a labelled table. */
+function discrepancyTable(sm) {
+  const bc = sm.by_check || {};
+  const rows = [
+    ['section', 'By technique (a voter can hit several)'],
+    ['cosine_new duplicate', sm.with_cosine],
+    ['fuzzy_new duplicate', sm.with_fuzzy],
+    ['Logical discrepancy (any)', sm.with_logical],
+    ['No category mapping (na)', sm.with_nomap],
+    ['section', 'Logical discrepancy — by type'],
+    ['Progeny ≥ 6', bc.progeny_overload],
+    ['Father-name conflict', bc.father_name_conflict],
+    ['Parent age gap < 15', bc.parent_age_under_15],
+    ['Parent age gap > 50', bc.parent_age_over_50],
+    ['Grandparent age gap ≤ 40', bc.grandparent_age_le_40],
+    ['Roll-age vs DOB-age gap > 5', bc.age_dob_gap],
+    ['section', 'Priority tier (each voter counted once)'],
+    ['Duplicate lead (fuzzy/cosine)', sm.tier_dup],
+    ['Logical only', sm.tier_logical],
+    ['No-mapping only', sm.tier_nomap],
+  ];
+  const tb = el('tbody', {});
+  rows.forEach(([label, val]) => {
+    if (label === 'section') {
+      tb.appendChild(el('tr', {}, el('td', {
+        colspan: '2',
+        style: 'background:var(--surface-2);color:var(--text-3);font-size:11px;text-transform:uppercase;letter-spacing:.05em;font-weight:700'
+      }, val)));
+    } else {
+      tb.appendChild(el('tr', {},
+        el('td', {}, label),
+        el('td', { class: 'mono', style: 'text-align:right;font-weight:600' }, fmtNum(val || 0))));
+    }
+  });
+  return el('div', { style: 'overflow:auto;border:1px solid var(--line-soft);border-radius:var(--radius-sm)' },
+    el('table', { class: 'data' },
+      el('thead', {}, el('tr', {},
+        el('th', {}, 'Discrepancy type'),
+        el('th', { style: 'text-align:right' }, 'Voters'))),
+      tb));
 }
 
 function facilityPanel(title, desc, onZip, parts, onPart) {
