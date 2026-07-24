@@ -1354,37 +1354,29 @@ async function viewCombined(view) {
     return;
   }
 
-  // constituency-wise discrepancy breakdown (defaults to the whole year)
-  const acBreakSel = selectEl(
-    [{ value: '', label: 'All constituencies' }].concat((summary.constituencies || []).map(a => ({ value: a, label: 'AC ' + a }))),
-    '', null, {});
+  // headline totals for the whole year — presence counts, not severity
+  const yr = summary.summary || {};
+  host.appendChild(el('div', { class: 'grid cols-4 mb' },
+    statCard('Total flagged voters', yr.total || 0, 'accent'),
+    statCard('With logical discrepancy', yr.with_logical || 0, 'medium'),
+    statCard('With no mapping (na)', yr.with_nomap || 0, 'medium'),
+    statCard('With duplicate (cosine/fuzzy)', yr.tier_dup || 0, 'high')));
+
+  // constituency-wise discrepancy counts (yes-counts per type; no high/med/low)
   const breakHost = el('div', {});
-
-  const renderBreakdown = (sm) => {
-    clear(breakHost);
-    breakHost.appendChild(el('div', { class: 'grid cols-4 mb' },
-      statCard('Flagged voters', sm.total || 0, 'accent'),
-      statCard('High', sm.high || 0, 'high'),
-      statCard('Medium', sm.medium || 0, 'medium'),
-      statCard('Low', sm.low || 0, 'low')));
-    breakHost.appendChild(discrepancyTable(sm));
-  };
-
-  const loadBreakdown = async () => {
-    clear(breakHost); breakHost.appendChild(loadingRow('Loading counts…'));
-    const qs = new URLSearchParams({ year: state.year });
-    if (acBreakSel.value) qs.set('ac', acBreakSel.value);
-    try { const r = await api('/api/suspects/summary?' + qs.toString()); renderBreakdown(r.summary || {}); }
-    catch (e) { clear(breakHost); breakHost.appendChild(emptyState('⚠', 'Could not load counts', e.detail || e.message)); }
-  };
-
   host.appendChild(el('div', { class: 'panel pad mb' },
-    el('div', { class: 'wrap-flex mb', style: 'justify-content:space-between' },
-      el('div', { style: 'font-weight:700;font-size:15px' }, 'Discrepancy breakdown — count of each type by constituency'),
-      field('Constituency', acBreakSel)),
+    el('div', { style: 'font-weight:700;font-size:15px;margin-bottom:2px' }, 'Discrepancy breakdown — counts by constituency'),
+    el('div', { class: 'small dim', style: 'margin-bottom:10px' },
+      'How many flagged (doubtful) voters carry each type of discrepancy — per constituency and in total. Logical checks and no-mapping are yes/no presence counts (a voter either has it or not), not severity.'),
     breakHost));
-  acBreakSel.addEventListener('change', loadBreakdown);
-  renderBreakdown(summary.summary || {});
+  breakHost.appendChild(loadingRow('Loading constituency-wise counts…'));
+  api('/api/suspects/stats_by_ac?year=' + encodeURIComponent(state.year))
+    .then(stats => {
+      clear(breakHost);
+      if (stats.built === false) { breakHost.appendChild(emptyState('⚑', 'Not built', 'Build the combined model first.')); return; }
+      breakHost.appendChild(discrepancyMatrix(stats));
+    })
+    .catch(e => { clear(breakHost); breakHost.appendChild(emptyState('⚠', 'Could not load counts', e.detail || e.message)); });
 
   // shared scope controls — nothing is built until a specific part is requested
   const acOptions = [{ value: '', label: 'All constituencies' }].concat((summary.constituencies || []).map(a => ({ value: a, label: 'AC ' + a })));
@@ -1440,46 +1432,45 @@ async function viewCombined(view) {
     el('a', { href: '#/suspects' }, 'Browse the full suspect list →')));
 }
 
-/* Count of each discrepancy type for the current scope, as a labelled table. */
-function discrepancyTable(sm) {
-  const bc = sm.by_check || {};
-  const rows = [
-    ['section', 'By technique (a voter can hit several)'],
-    ['cosine_new duplicate', sm.with_cosine],
-    ['fuzzy_new duplicate', sm.with_fuzzy],
-    ['Logical discrepancy (any)', sm.with_logical],
-    ['No category mapping (na)', sm.with_nomap],
-    ['section', 'Logical discrepancy — by type'],
-    ['Progeny ≥ 6', bc.progeny_overload],
-    ['Father-name conflict', bc.father_name_conflict],
-    ['Parent age gap < 15', bc.parent_age_under_15],
-    ['Parent age gap > 50', bc.parent_age_over_50],
-    ['Grandparent age gap ≤ 40', bc.grandparent_age_le_40],
-    ['Roll-age vs DOB-age gap > 5', bc.age_dob_gap],
-    ['section', 'Priority tier (each voter counted once)'],
-    ['Duplicate lead (fuzzy/cosine)', sm.tier_dup],
-    ['Logical only', sm.tier_logical],
-    ['No-mapping only', sm.tier_nomap],
+/* Constituency-wise count of each discrepancy type (presence/yes counts), one
+   row per AC plus a total row. `stats` = {by_ac:[{ac,name,summary}], overall}. */
+function discrepancyMatrix(stats) {
+  const bc = s => s.by_check || {};
+  // [header label, tooltip, value-getter]
+  const cols = [
+    ['Flagged', 'Flagged (doubtful) voters in this constituency', s => s.total],
+    ['cosine', 'Voters with a cosine_new duplicate', s => s.with_cosine],
+    ['fuzzy', 'Voters with a fuzzy_new duplicate', s => s.with_fuzzy],
+    ['Logical', 'Voters with any logical discrepancy (yes)', s => s.with_logical],
+    ['No-map', 'Voters with no category mapping = na (yes)', s => s.with_nomap],
+    ['Progeny≥6', 'Progeny ≥ 6', s => bc(s).progeny_overload],
+    ['Father-name', 'Father-name conflict', s => bc(s).father_name_conflict],
+    ['Parent<15', 'Parent age gap < 15', s => bc(s).parent_age_under_15],
+    ['Parent>50', 'Parent age gap > 50', s => bc(s).parent_age_over_50],
+    ['GParent≤40', 'Grandparent age gap ≤ 40', s => bc(s).grandparent_age_le_40],
+    ['Age–DOB>5', 'Roll-age vs DOB-age gap > 5 years', s => bc(s).age_dob_gap],
   ];
-  const tb = el('tbody', {});
-  rows.forEach(([label, val]) => {
-    if (label === 'section') {
-      tb.appendChild(el('tr', {}, el('td', {
-        colspan: '2',
-        style: 'background:var(--surface-2);color:var(--text-3);font-size:11px;text-transform:uppercase;letter-spacing:.05em;font-weight:700'
-      }, val)));
-    } else {
-      tb.appendChild(el('tr', {},
-        el('td', {}, label),
-        el('td', { class: 'mono', style: 'text-align:right;font-weight:600' }, fmtNum(val || 0))));
-    }
+  const head = el('tr', {},
+    el('th', {}, 'Constituency'),
+    ...cols.map(([label, tip]) => el('th', { style: 'text-align:right', title: tip }, label)));
+  const cell = (s, bold) => cols.map(([, , f]) => el('td', {
+    class: 'mono', style: 'text-align:right' + (bold ? ';font-weight:700;color:var(--amber)' : '')
+  }, fmtNum(f(s) || 0)));
+  const body = el('tbody', {});
+  (stats.by_ac || []).forEach(row => {
+    const s = row.summary || {};
+    body.appendChild(el('tr', {},
+      el('td', {}, el('b', {}, 'AC ' + row.ac), row.name ? el('span', { class: 'small dim' }, '  ' + row.name) : null),
+      ...cell(s, false)));
   });
-  return el('div', { style: 'overflow:auto;border:1px solid var(--line-soft);border-radius:var(--radius-sm)' },
-    el('table', { class: 'data' },
-      el('thead', {}, el('tr', {},
-        el('th', {}, 'Discrepancy type'),
-        el('th', { style: 'text-align:right' }, 'Voters'))),
-      tb));
+  body.appendChild(el('tr', { style: 'border-top:2px solid var(--line)' },
+    el('td', {}, el('b', {}, 'All constituencies (total)')),
+    ...cell(stats.overall || {}, true)));
+  return el('div', {},
+    el('div', { style: 'overflow:auto;border:1px solid var(--line-soft);border-radius:var(--radius-sm)' },
+      el('table', { class: 'data' }, el('thead', {}, head), body)),
+    el('div', { class: 'small dim mt' },
+      'Each number is a yes count — flagged voters that carry that discrepancy. A voter can appear under several columns (e.g. both logical and a duplicate); the “Flagged” column is that constituency’s unique total. Hover a header for its full meaning.'));
 }
 
 function facilityPanel(title, desc, onZip, parts, onPart) {

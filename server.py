@@ -290,6 +290,37 @@ async def api_suspects_summary(year: int, ac: str | None = None,
                              "constituencies": constituencies})
 
 
+@app.get("/api/suspects/stats_by_ac")
+async def api_suspects_stats_by_ac(year: int,
+                                   user: str = Depends(webauth.require_auth)):
+    """Per-constituency discrepancy counts plus the whole-year total, for the
+    Combined Model breakdown matrix. Every value is a presence (yes) count — the
+    number of flagged voters that carry that discrepancy — not a severity."""
+    with _combined_lock:
+        entry = _combined_cache.get(int(year))
+    if not entry:
+        return {"built": False}
+
+    def work():
+        from collections import defaultdict
+        from combined_model import combined_summary
+        records = entry["records"]
+        groups: dict = defaultdict(list)
+        for r in records:
+            key = (r.get("constituency_no") or "").strip() or "(unknown)"
+            groups[key].append(r)
+        by_ac = [{"ac": ac,
+                  "name": next((g.get("constituency_name") for g in recs
+                                if g.get("constituency_name")), None),
+                  "summary": combined_summary(recs)}
+                 for ac, recs in sorted(groups.items())]
+        return by_ac, combined_summary(records)
+
+    by_ac, overall = await run_in_threadpool(work)
+    return jsonable_encoder({"built": True, "built_at": entry["built_at"],
+                             "overall": overall, "by_ac": by_ac})
+
+
 @app.get("/api/suspects")
 async def api_suspects(
     year: int,
