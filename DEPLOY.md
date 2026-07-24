@@ -30,12 +30,15 @@ git push -u origin main
    Git account).
 2. Paste the repo URL. Coolify auto-detects the **Dockerfile** — leave build
    pack as *Dockerfile*.
-3. **Ports**: set the exposed port to **8501**.
+3. **Ports**: set the exposed port to **8000**.
 4. **Environment variables** → add:
    - `MISTRAL_API_KEY` = your key
    - `APP_USERNAME` = the login username you want
    - `APP_PASSWORD_HASH` = output of `python make_password.py` (**required** —
      the app refuses to serve any data without it)
+   - `APP_SESSION_SECRET` = any random string (signs session cookies; generate
+     with `python -c "import secrets;print(secrets.token_hex(32))"`). Keep it
+     stable so sessions survive restarts.
    - (optional) `OCR_MODEL`, `STRUCTURE_MODEL` — defaults are fine.
 
    > **Never put a `$` in an environment variable value here.** Coolify feeds
@@ -65,14 +68,16 @@ echo "MISTRAL_API_KEY=your_key_here" > .env
 docker compose up -d --build
 ```
 
-App is then at `http://200.97.160.149:8501`. Put it behind Coolify's proxy or a
+App is then at `http://200.97.160.149:8000`. Put it behind Coolify's proxy or a
 reverse proxy for HTTPS.
 
 ---
 
 ## After deploy
 
-- Open the URL, upload a PDF, click **Convert & build ZIP**, download the ZIP
-  (PDF + Excel + `photos/`).
+- Open the URL and sign in. Use the **Ingest** view to upload a PDF, extract the
+  voter records, download the ZIP, and ingest it into the database for a year.
+- Run fraud rules and work the **Suspects** and **Review** views to triage
+  duplicate / similar voters.
 - Large PDFs (> 25 pages) are OCR'd in 15-page batches automatically.
 - **Rotate the root password you shared** — treat it as compromised.

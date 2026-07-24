@@ -1,7 +1,16 @@
-# Electoral Roll → Excel
+# Electoral Roll Command Center
 
-Upload an electoral-roll PDF, extract per-voter records with **Mistral Document
-OCR**, and download a clean Excel file.
+A single-page **command center** for electoral-roll fraud-voter detection. Ingest
+electoral-roll PDFs (extract per-voter records with **Mistral Document OCR**),
+store them in Postgres, run fraud rules, and work a **suspects / cluster view**
+that shows one voter alongside the N similar voters it matches. Built as a
+**FastAPI** backend (`server.py`) serving a self-contained vanilla-JS SPA
+(`web/`).
+
+The suspects view is the centerpiece: each suspect card shows the primary voter
+plus a strip of match tiles (e.g. "a voter with 4 similar voters" = 4 tiles),
+with per-attribute comparison, a review queue, database explorer, ECINET
+enrichment, and PDF/ZIP report exports alongside it.
 
 ## Extracted columns
 
@@ -20,21 +29,29 @@ cp .env.example .env        # then paste your Mistral API key into .env
 
 Get a key at https://console.mistral.ai.
 
+Also set the login and session-cookie vars (see `.env.example`): `APP_USERNAME`,
+`APP_PASSWORD_HASH` (from `python make_password.py`), and `APP_SESSION_SECRET`
+(any random string).
+
 ## Run
 
 ```bash
-./.venv/bin/streamlit run app.py
+./.venv/bin/uvicorn server:app --reload --port 8000
 ```
 
-Then in the browser: upload a PDF → **Convert to Excel** → download.
+Then open http://localhost:8000 and sign in. The SPA loads the Overview
+dashboard; use the left rail to reach Suspects, Review, Explore, Ingest,
+Enrichment and Reports.
 
-## Options (sidebar)
+## Ingest options
 
-- **Auto-remove cover pages** — toggle that drops the first 2 and last 2 pages
-  (cover / maps / summary / legend). Counts are adjustable.
+When ingesting a PDF (Ingest view):
+
+- **Trim cover pages** — drops the first/last pages (cover / maps / summary /
+  legend); the drop counts are adjustable.
 - **Structuring method**
-  - **LLM** (default) — Mistral turns the OCR text into clean rows; most robust
-    against multi-column reading-order noise. Uses a few extra API calls.
+  - **LLM** — Mistral turns the OCR text into clean rows; most robust against
+    multi-column reading-order noise. Uses a few extra API calls.
   - **Regex** — free, fully local parsing. Good when OCR text is tidy.
 
 ## Swapping the OCR provider
@@ -53,7 +70,11 @@ To use a different one, add an `OCRProvider` subclass, register it in
 
 | File | Purpose |
 |------|---------|
-| `app.py` | Streamlit UI (upload, toggle, download) |
+| `server.py` | FastAPI API + serves the SPA (all endpoints under `/api`) |
+| `web/` | Vanilla-JS command-center SPA (no build step) |
+| `security.py` | Password hashing / verification |
+| `webauth.py` | Session auth (login, logout, require_auth) |
+| `reports.py` | PDF/ZIP report builders |
 | `pdf_utils.py` | Trim cover/summary pages |
 | `ocr_providers.py` | Swappable OCR adapter (Mistral by default) |
 | `extractor.py` | OCR text → structured voter rows (LLM + regex) |
